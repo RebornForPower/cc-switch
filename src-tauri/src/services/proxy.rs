@@ -88,6 +88,103 @@ impl CodexAuthFileSnapshot {
     }
 }
 
+/// Install `source` at an empty `destination` without ever replacing a file
+/// that appeared there concurrently. Hard links keep the existing atomic
+/// behavior on regular filesystems; WSL's 9P filesystem rejects hard links,
+/// so Windows falls back to MoveFileExW without MOVEFILE_REPLACE_EXISTING.
+/// The fallback consumes `source`; callers must tolerate it being absent when
+/// cleaning up after a successful placement.
+fn place_file_if_vacant(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    match std::fs::hard_link(source, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if hard_link_is_not_supported(&error) => {
+            #[cfg(windows)]
+            {
+                move_file_if_vacant_windows(source, destination)
+            }
+            #[cfg(not(windows))]
+            {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn hard_link_is_not_supported(error: &std::io::Error) -> bool {
+    use windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED;
+
+    error.raw_os_error() == Some(ERROR_NOT_SUPPORTED as i32)
+}
+
+#[cfg(not(windows))]
+fn hard_link_is_not_supported(_error: &std::io::Error) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn move_file_if_vacant_windows(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    let source: Vec<u16> = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // SAFETY: both UTF-16 buffers are NUL-terminated and stay alive for the
+    // duration of the call. A zero flag deliberately forbids replacement.
+    let moved = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn destination_already_exists(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+
+        matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_ALREADY_EXISTS as i32 || code == ERROR_FILE_EXISTS as i32
+        )
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn remove_file_if_present(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Owns the exact auth.json generation observed at restore start.
 ///
 /// A plain compare-then-write is unsafe because Codex can replace auth.json
@@ -122,29 +219,41 @@ impl CodexAuthFileTransaction {
             };
         };
 
-        // The no-clobber install/rollback protocol below requires hard links.
-        // Probe before moving the live credentials so unsupported custom Codex
-        // directories fail closed with auth.json still in place.
+        // Probe the same no-clobber primitive used by install/rollback before
+        // moving the live credentials. This keeps unsupported custom Codex
+        // directories fail-closed with auth.json still in place.
+        let probe_source = Self::unique_sibling_path(&path, "restore-probe-source")?;
         let probe = Self::unique_sibling_path(&path, "restore-probe")?;
-        match std::fs::hard_link(&path, &probe) {
-            Ok(()) => {
-                std::fs::remove_file(&probe).map_err(|error| {
-                    format!(
-                        "清理 Codex auth 事务能力探针失败 ({}): {error}",
-                        probe.display()
-                    )
-                })?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Self::changed_error());
-            }
-            Err(error) => {
-                return Err(format!(
-                    "Codex auth 所在文件系统不支持安全恢复，原凭据未修改 ({}): {error}",
-                    path.display()
-                ));
-            }
+        let probe_result = (|| -> std::io::Result<()> {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            let mut file = options.open(&probe_source)?;
+            use std::io::Write;
+            file.write_all(b"cc-switch-restore-probe")?;
+            file.flush()?;
+            drop(file);
+            place_file_if_vacant(&probe_source, &probe)
+        })();
+        let probe_source_cleanup = remove_file_if_present(&probe_source);
+        let probe_cleanup = remove_file_if_present(&probe);
+        if let Err(error) = probe_result {
+            return Err(format!(
+                "Codex auth 所在文件系统不支持安全恢复，原凭据未修改 ({}): {error}",
+                path.display()
+            ));
         }
+        probe_source_cleanup.map_err(|error| {
+            format!(
+                "清理 Codex auth 事务能力探针源文件失败 ({}): {error}",
+                probe_source.display()
+            )
+        })?;
+        probe_cleanup.map_err(|error| {
+            format!(
+                "清理 Codex auth 事务能力探针失败 ({}): {error}",
+                probe.display()
+            )
+        })?;
 
         let quarantine = Self::unique_sibling_path(&path, "restore-backup")?;
         match std::fs::rename(&path, &quarantine) {
@@ -218,11 +327,9 @@ impl CodexAuthFileTransaction {
                 })?;
             drop(file);
 
-            match std::fs::hard_link(&temporary, &self.path) {
+            match place_file_if_vacant(&temporary, &self.path) {
                 Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    Err(Self::changed_error())
-                }
+                Err(error) if destination_already_exists(&error) => Err(Self::changed_error()),
                 Err(error) => Err(format!(
                     "安装 Codex auth 失败 ({}): {error}",
                     self.path.display()
@@ -313,20 +420,17 @@ impl CodexAuthFileTransaction {
         source: &std::path::Path,
         destination: &std::path::Path,
     ) -> Result<(), String> {
-        match std::fs::hard_link(source, destination) {
-            Ok(()) => {
-                std::fs::remove_file(source).map_err(|error| {
-                    format!(
-                        "清理 Codex auth 事务文件失败 ({}): {error}",
-                        source.display()
-                    )
-                })?;
-                Ok(())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+        match place_file_if_vacant(source, destination) {
+            Ok(()) => remove_file_if_present(source).map_err(|error| {
+                format!(
+                    "清理 Codex auth 事务文件失败 ({}): {error}",
+                    source.display()
+                )
+            }),
+            Err(error) if destination_already_exists(&error) => {
                 // The destination was recreated by Codex and is newer than the
                 // quarantined generation.
-                std::fs::remove_file(source).map_err(|remove_error| {
+                remove_file_if_present(source).map_err(|remove_error| {
                     format!(
                         "清理旧 Codex auth 事务文件失败 ({}): {remove_error}",
                         source.display()
@@ -4016,6 +4120,19 @@ mod tests {
     impl TempHome {
         fn new() -> Self {
             let dir = TempDir::new().expect("failed to create temp home");
+            Self::from_dir(dir)
+        }
+
+        #[cfg(windows)]
+        fn new_in(root: &std::path::Path) -> Self {
+            let dir = tempfile::Builder::new()
+                .prefix("cc-switch-wsl-home-")
+                .tempdir_in(root)
+                .expect("failed to create WSL test home");
+            Self::from_dir(dir)
+        }
+
+        fn from_dir(dir: TempDir) -> Self {
             let original_home = env::var("HOME").ok();
             let original_userprofile = env::var("USERPROFILE").ok();
             let original_test_home = env::var("CC_SWITCH_TEST_HOME").ok();
@@ -9282,6 +9399,114 @@ base_url = "https://third.example/v1"
                 .and_then(Value::as_str),
             Some("new-rt")
         );
+    }
+
+    #[test]
+    #[serial]
+    fn codex_auth_no_replace_placement_preserves_existing_destination() {
+        let dir = tempfile::tempdir().expect("create transaction test directory");
+        let source = dir.path().join("source-auth.json");
+        let destination = dir.path().join("destination-auth.json");
+        std::fs::write(&source, b"replacement-auth").expect("seed source auth");
+
+        place_file_if_vacant(&source, &destination).expect("place into vacant destination");
+        remove_file_if_present(&source).expect("clean placed source");
+        assert_eq!(
+            std::fs::read(&destination).expect("read placed auth"),
+            b"replacement-auth"
+        );
+        assert!(
+            !source.exists(),
+            "source cleanup must handle both hard-link and move placement"
+        );
+
+        std::fs::write(&source, b"older-auth").expect("seed older source auth");
+        std::fs::write(&destination, b"newer-auth").expect("seed newer destination auth");
+        let error = place_file_if_vacant(&source, &destination)
+            .expect_err("an existing destination must reject replacement");
+
+        assert!(destination_already_exists(&error));
+        assert_eq!(
+            std::fs::read(&destination).expect("read preserved destination"),
+            b"newer-auth"
+        );
+        assert_eq!(
+            std::fs::read(&source).expect("read unconsumed source"),
+            b"older-auth"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    #[ignore = "requires CC_SWITCH_WSL_TEST_DIR to point to a WSL2 UNC directory"]
+    fn codex_auth_transaction_supports_wsl_unc_no_replace_restore() {
+        let root = std::path::PathBuf::from(
+            env::var_os("CC_SWITCH_WSL_TEST_DIR").expect("CC_SWITCH_WSL_TEST_DIR must be set"),
+        );
+        let root_text = root.to_string_lossy();
+        assert!(
+            root_text.starts_with(r"\\wsl.localhost\") || root_text.starts_with(r"\\wsl$\"),
+            "expected a WSL UNC root, got {root_text}"
+        );
+        let _home = TempHome::new_in(&root);
+        crate::settings::update_settings(crate::settings::AppSettings::default())
+            .expect("reset settings in WSL home");
+        crate::settings::reload_settings().expect("reload settings in WSL home");
+
+        let auth_path = crate::codex_config::get_codex_auth_path();
+        std::fs::create_dir_all(auth_path.parent().expect("auth parent")).expect("create auth dir");
+        let original = br#"{"OPENAI_API_KEY":"PROXY_MANAGED"}"#;
+        std::fs::write(&auth_path, original).expect("seed WSL auth");
+        let snapshot = CodexAuthFileSnapshot::capture().expect("capture WSL auth");
+        let mut transaction = CodexAuthFileTransaction::begin(&snapshot)
+            .expect("WSL auth transaction should use no-replace fallback");
+        transaction
+            .install(Some(br#"{"OPENAI_API_KEY":"restored"}"#.to_vec()))
+            .expect("install WSL auth through no-replace fallback");
+        transaction.rollback().expect("rollback WSL auth");
+
+        assert_eq!(
+            std::fs::read(&auth_path).expect("read restored WSL auth"),
+            original
+        );
+
+        let snapshot = CodexAuthFileSnapshot::capture().expect("recapture WSL auth");
+        let mut transaction =
+            CodexAuthFileTransaction::begin(&snapshot).expect("begin second WSL auth transaction");
+        transaction
+            .install(Some(br#"{"OPENAI_API_KEY":"restored"}"#.to_vec()))
+            .expect("install second WSL auth generation");
+        let newer = br#"{"auth_mode":"chatgpt","tokens":{"refresh_token":"newer"}}"#;
+        std::fs::write(&auth_path, newer).expect("simulate newer WSL login");
+        transaction
+            .rollback()
+            .expect("rollback must preserve newer WSL login");
+        assert_eq!(
+            std::fs::read(&auth_path).expect("read newer WSL auth"),
+            newer
+        );
+
+        let collision_source =
+            CodexAuthFileTransaction::unique_sibling_path(&auth_path, "wsl-collision-source")
+                .expect("create collision source path");
+        std::fs::write(&collision_source, b"stale-auth").expect("seed collision source");
+        let collision = place_file_if_vacant(&collision_source, &auth_path)
+            .expect_err("WSL no-replace move must reject an existing destination");
+        assert!(destination_already_exists(&collision));
+        remove_file_if_present(&collision_source).expect("clean collision source");
+        assert_eq!(
+            std::fs::read(&auth_path).expect("read preserved WSL auth"),
+            newer
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(auth_path.parent().expect("auth parent"))
+            .expect("read WSL auth directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".cc-switch-restore-"))
+            .collect();
+        assert!(leftovers.is_empty(), "transaction files must be cleaned up");
     }
 
     #[tokio::test]
