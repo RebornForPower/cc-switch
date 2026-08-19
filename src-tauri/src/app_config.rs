@@ -435,6 +435,14 @@ impl AppType {
         )
     }
 
+    /// Check whether the app can use the proxy provider failover data plane.
+    ///
+    /// Codex Desktop shares the gateway transport, but it deliberately does
+    /// not participate in Live takeover or the `proxy_config` table.
+    pub fn supports_failover(&self) -> bool {
+        self.supports_local_proxy() || matches!(self, AppType::CodexDesktop)
+    }
+
     /// Return an iterator over all app types
     pub fn all() -> impl Iterator<Item = AppType> {
         [

@@ -12,6 +12,10 @@ const TAURI_ENDPOINT = "http://tauri.local";
 const useDragSortMock = vi.fn();
 const useSortableMock = vi.fn();
 const providerCardRenderSpy = vi.fn();
+const useAutoFailoverEnabledMock = vi.fn();
+const useFailoverQueueMock = vi.fn();
+const addToFailoverQueueMock = vi.fn();
+const removeFromFailoverQueueMock = vi.fn();
 
 vi.mock("@/hooks/useDragSort", () => ({
   useDragSort: (...args: unknown[]) => useDragSortMock(...args),
@@ -94,10 +98,11 @@ vi.mock("@/hooks/useStreamCheck", () => ({
 }));
 
 vi.mock("@/lib/query/failover", () => ({
-  useAutoFailoverEnabled: () => ({ data: false }),
-  useFailoverQueue: () => ({ data: [] }),
-  useAddToFailoverQueue: () => ({ mutate: vi.fn() }),
-  useRemoveFromFailoverQueue: () => ({ mutate: vi.fn() }),
+  useAutoFailoverEnabled: (...args: unknown[]) =>
+    useAutoFailoverEnabledMock(...args),
+  useFailoverQueue: (...args: unknown[]) => useFailoverQueueMock(...args),
+  useAddToFailoverQueue: () => ({ mutate: addToFailoverQueueMock }),
+  useRemoveFromFailoverQueue: () => ({ mutate: removeFromFailoverQueueMock }),
   useReorderFailoverQueue: () => ({ mutate: vi.fn() }),
 }));
 
@@ -128,6 +133,12 @@ beforeEach(() => {
   useDragSortMock.mockReset();
   useSortableMock.mockReset();
   providerCardRenderSpy.mockClear();
+  useAutoFailoverEnabledMock.mockReset();
+  useFailoverQueueMock.mockReset();
+  addToFailoverQueueMock.mockReset();
+  removeFromFailoverQueueMock.mockReset();
+  useAutoFailoverEnabledMock.mockReturnValue({ data: false });
+  useFailoverQueueMock.mockReturnValue({ data: [] });
 
   useSortableMock.mockImplementation(({ id }: { id: string }) => ({
     setNodeRef: vi.fn(),
@@ -146,6 +157,171 @@ beforeEach(() => {
 });
 
 describe("ProviderList Component", () => {
+  it("uses the running Desktop gateway for failover queue actions", async () => {
+    const proxyProvider = createProvider({
+      id: "desktop-proxy",
+      name: "Desktop Proxy",
+      meta: { codexDesktopMode: "proxy" },
+    });
+    const directProvider = createProvider({
+      id: "desktop-direct",
+      name: "Desktop Direct",
+      meta: { codexDesktopMode: "direct" },
+    });
+    const officialProvider = createProvider({
+      id: "desktop-official",
+      name: "Desktop Official",
+      category: "official",
+      meta: { codexDesktopMode: "proxy" },
+    });
+    useDragSortMock.mockReturnValue({
+      sortedProviders: [proxyProvider, directProvider, officialProvider],
+      sensors: [],
+      handleDragEnd: vi.fn(),
+    });
+    useAutoFailoverEnabledMock.mockReturnValue({ data: true });
+    useFailoverQueueMock.mockReturnValue({
+      data: [
+        { providerId: proxyProvider.id, providerName: proxyProvider.name },
+      ],
+    });
+
+    renderWithQueryClient(
+      <ProviderList
+        providers={{
+          [proxyProvider.id]: proxyProvider,
+          [directProvider.id]: directProvider,
+          [officialProvider.id]: officialProvider,
+        }}
+        currentProviderId={proxyProvider.id}
+        appId="codex-desktop"
+        isProxyRunning
+        // Desktop has no CLI-style proxy takeover flag.
+        isProxyTakeover={false}
+        activeProviderId={proxyProvider.id}
+        onSwitch={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onDuplicate={vi.fn()}
+        onOpenWebsite={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const latestProps = new Map(
+        providerCardRenderSpy.mock.calls.map(([props]) => [
+          props.provider.id,
+          props,
+        ]),
+      );
+      expect(latestProps.get(proxyProvider.id)).toMatchObject({
+        isAutoFailoverEnabled: true,
+        isInFailoverQueue: true,
+      });
+      expect(latestProps.get(proxyProvider.id).onToggleFailover).toEqual(
+        expect.any(Function),
+      );
+      expect(latestProps.get(directProvider.id)).toMatchObject({
+        isAutoFailoverEnabled: false,
+        isInFailoverQueue: false,
+        onToggleFailover: undefined,
+      });
+      expect(latestProps.get(officialProvider.id)).toMatchObject({
+        isAutoFailoverEnabled: false,
+        isInFailoverQueue: false,
+        onToggleFailover: undefined,
+      });
+    });
+
+    const latestProps = new Map(
+      providerCardRenderSpy.mock.calls.map(([props]) => [
+        props.provider.id,
+        props,
+      ]),
+    );
+    latestProps.get(proxyProvider.id).onToggleFailover(false);
+    latestProps.get(proxyProvider.id).onToggleFailover(true);
+    expect(removeFromFailoverQueueMock).toHaveBeenCalledWith({
+      appType: "codex-desktop",
+      providerId: proxyProvider.id,
+    });
+    expect(addToFailoverQueueMock).toHaveBeenCalledWith({
+      appType: "codex-desktop",
+      providerId: proxyProvider.id,
+    });
+  });
+
+  it("keeps legacy Codex account cards out of the Desktop queue", async () => {
+    const legacyOfficial = createProvider({
+      id: "codex-official",
+      name: "Codex login",
+      // Older rows may carry the explicit proxy mode but no category.
+      meta: { codexDesktopMode: "proxy" },
+      settingsConfig: { auth: {}, config: "" },
+    });
+    const managedAccount = createProvider({
+      id: "managed-account",
+      name: "Managed account",
+      meta: {
+        codexDesktopMode: "proxy",
+        authBinding: {
+          source: "managed_account",
+          authProvider: "codex_oauth",
+          accountId: "account-1",
+        },
+      },
+      settingsConfig: { auth: {}, config: "" },
+    });
+    const proxyProvider = createProvider({
+      id: "third-party-proxy",
+      name: "Third-party proxy",
+      meta: { codexDesktopMode: "proxy" },
+    });
+    useDragSortMock.mockReturnValue({
+      sortedProviders: [legacyOfficial, managedAccount, proxyProvider],
+      sensors: [],
+      handleDragEnd: vi.fn(),
+    });
+    useAutoFailoverEnabledMock.mockReturnValue({ data: true });
+    useFailoverQueueMock.mockReturnValue({ data: [] });
+
+    renderWithQueryClient(
+      <ProviderList
+        providers={{
+          [legacyOfficial.id]: legacyOfficial,
+          [managedAccount.id]: managedAccount,
+          [proxyProvider.id]: proxyProvider,
+        }}
+        currentProviderId={proxyProvider.id}
+        appId="codex-desktop"
+        isProxyRunning
+        onSwitch={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onDuplicate={vi.fn()}
+        onOpenWebsite={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const latestProps = new Map(
+        providerCardRenderSpy.mock.calls.map(([props]) => [
+          props.provider.id,
+          props,
+        ]),
+      );
+      expect(
+        latestProps.get(legacyOfficial.id).onToggleFailover,
+      ).toBeUndefined();
+      expect(
+        latestProps.get(managedAccount.id).onToggleFailover,
+      ).toBeUndefined();
+      expect(latestProps.get(proxyProvider.id).onToggleFailover).toEqual(
+        expect.any(Function),
+      );
+    });
+  });
+
   it("should render skeleton placeholders when loading", () => {
     const { container } = renderWithQueryClient(
       <ProviderList

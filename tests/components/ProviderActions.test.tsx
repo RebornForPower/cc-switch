@@ -52,6 +52,28 @@ function renderPiActions({
 }
 
 describe("ProviderActions Pi provider switching", () => {
+  it("uses queue membership actions for an active Codex Desktop failover provider", async () => {
+    const user = userEvent.setup();
+    const onToggleFailover = vi.fn();
+
+    render(
+      <ProviderActions
+        appId="codex-desktop"
+        isCurrent={false}
+        isAutoFailoverEnabled
+        isInFailoverQueue={false}
+        onToggleFailover={onToggleFailover}
+        onSwitch={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "加入" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "加入" }));
+    expect(onToggleFailover).toHaveBeenCalledWith(true);
+  });
+
   it("omits duplication when the caller disallows it", () => {
     render(
       <ProviderActions

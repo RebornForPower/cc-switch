@@ -2803,7 +2803,8 @@
     "tooltip": {
       "enabled": "{{app}} 故障转移已启用\n按队列优先级（P1→P2→...）选择供应商",
       "disabled": "启用 {{app}} 故障转移\n将立即切换到队列 P1，并在失败时自动切换到下一个",
-      "takeoverRequired": "请先接管 {{app}}，再启用故障转移"
+      "takeoverRequired": "请先接管 {{app}}，再启用故障转移",
+      "localRouteRequired": "请先开启 {{app}} 本地路由，再启用故障转移"
     }
   },
   "proxy": {

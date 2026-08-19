@@ -214,6 +214,13 @@ pub struct ProfileService;
 
 impl ProfileService {
     fn codex_desktop_requires_gateway(state: &AppState) -> Result<bool, AppError> {
+        // The failover switch is an independent Desktop gateway consumer. It
+        // must keep the shared server alive even if the current provider row
+        // is temporarily missing or contains stale mode metadata.
+        if state.db.get_codex_desktop_auto_failover_enabled()? {
+            return Ok(true);
+        }
+
         let Some(provider_id) =
             crate::settings::get_effective_current_provider(&state.db, &AppType::CodexDesktop)?
         else {

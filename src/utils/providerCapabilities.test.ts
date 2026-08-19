@@ -2,7 +2,9 @@ import { describe, it, expect } from "vitest";
 import type { Provider } from "@/types";
 import type { AppId } from "@/lib/api";
 import {
+  codexDesktopProviderSupportsFailover,
   providerNeedsRouting,
+  resolveCodexDesktopProviderMode,
   resolveCodexOfficialIdentity,
   supportsOfficialProxyTakeover,
 } from "@/utils/providerCapabilities";
@@ -410,6 +412,29 @@ describe("providerNeedsRouting", () => {
           }),
         ),
       ).toBe(true);
+    });
+
+    it("缺少显式 mode 的旧 Responses 配置按 Rust fallback 使用网关", () => {
+      const legacy = mkProvider({
+        category: "custom",
+        settingsConfig: { config: codexConfig("responses") },
+      });
+
+      expect(resolveCodexDesktopProviderMode(legacy)).toBe("proxy");
+      expect(providerNeedsRouting("codex-desktop", legacy)).toBe(true);
+      expect(codexDesktopProviderSupportsFailover(legacy)).toBe(true);
+    });
+
+    it("显式 Responses meta 保持 Direct 且不能加入 Desktop 队列", () => {
+      const native = mkProvider({
+        category: "custom",
+        meta: { apiFormat: "openai_responses" },
+        settingsConfig: { config: codexConfig("responses") },
+      });
+
+      expect(resolveCodexDesktopProviderMode(native)).toBe("direct");
+      expect(providerNeedsRouting("codex-desktop", native)).toBe(false);
+      expect(codexDesktopProviderSupportsFailover(native)).toBe(false);
     });
   });
 });

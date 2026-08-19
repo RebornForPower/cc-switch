@@ -19,6 +19,8 @@ export type CodexOfficialIdentity =
   | "managed_account"
   | "api_key";
 
+export type CodexDesktopProviderMode = "direct" | "proxy";
+
 const nonEmptyString = (value: unknown): boolean =>
   typeof value === "string" && value.trim().length > 0;
 
@@ -88,6 +90,49 @@ export function resolveCodexOfficialIdentity(
     : null;
 }
 
+/** Mirror Rust `codex_desktop_config::provider_mode` for legacy rows. */
+export function resolveCodexDesktopProviderMode(
+  provider: Pick<Provider, "id" | "category" | "meta" | "settingsConfig">,
+): CodexDesktopProviderMode {
+  const explicitMode = provider.meta?.codexDesktopMode;
+  if (explicitMode) return explicitMode;
+
+  const settings = provider.settingsConfig as Record<string, unknown>;
+  const env = settings?.env as Record<string, unknown> | undefined;
+  const legacyManagedBaseUrl = env?.ANTHROPIC_BASE_URL;
+  const usesManagedAccountAuth =
+    isOAuthProviderType(provider.meta?.providerType) ||
+    (typeof legacyManagedBaseUrl === "string" &&
+      (legacyManagedBaseUrl.includes("githubcopilot.com") ||
+        legacyManagedBaseUrl.includes("chatgpt.com/backend-api/codex")));
+
+  if (usesManagedAccountAuth || provider.meta?.isFullUrl === true) {
+    return "proxy";
+  }
+
+  if (
+    provider.category === "official" ||
+    resolveCodexOfficialIdentity("codex-desktop", provider) !== null
+  ) {
+    return "direct";
+  }
+
+  // Rust treats only an explicit meta-level Responses format as Direct.
+  // Legacy rows without it fall back to Proxy even if TOML says `responses`.
+  return provider.meta?.apiFormat === "openai_responses" ? "direct" : "proxy";
+}
+
+/** Keep Desktop queue membership aligned with Rust `provider_supports_failover`. */
+export function codexDesktopProviderSupportsFailover(
+  provider: Pick<Provider, "id" | "category" | "meta" | "settingsConfig">,
+): boolean {
+  return (
+    provider.category !== "official" &&
+    resolveCodexOfficialIdentity("codex-desktop", provider) === null &&
+    resolveCodexDesktopProviderMode(provider) === "proxy"
+  );
+}
+
 /** Keep the UI capability rule aligned with the Rust takeover policy. */
 export function supportsOfficialProxyTakeover(
   appId: AppId,
@@ -126,10 +171,8 @@ export function providerNeedsRouting(
   // Codex Desktop is the one official-provider exception: managed account
   // tokens are injected by its gateway and therefore still require routing.
   if (appId === "codex-desktop") {
-    if (isManagedOAuth || provider.meta?.codexDesktopMode === "proxy") {
-      return true;
-    }
-    if (provider.meta?.codexDesktopMode === "direct") return false;
+    if (isManagedOAuth) return true;
+    return resolveCodexDesktopProviderMode(provider) === "proxy";
   }
 
   if (provider.category === "official") return false;

@@ -2476,6 +2476,57 @@ requires_openai_auth = true
 
     #[test]
     #[serial]
+    fn update_current_codex_desktop_rejects_direct_mode_while_failover_enabled() {
+        with_test_home(|state, home| {
+            let _settings = configure_distinct_codex_test_dirs(home);
+            let mut original = codex_desktop_direct_provider("desktop-failover", "old-key");
+            original.meta = Some(crate::provider::ProviderMeta {
+                codex_desktop_mode: Some(crate::provider::CodexDesktopMode::Proxy),
+                ..original.meta.take().unwrap_or_default()
+            });
+            state
+                .db
+                .save_provider(AppType::CodexDesktop.as_str(), &original)
+                .expect("save Desktop Proxy provider");
+            state
+                .db
+                .set_current_provider(AppType::CodexDesktop.as_str(), &original.id)
+                .expect("set Desktop current");
+            state
+                .db
+                .set_codex_desktop_auto_failover_enabled(true)
+                .expect("enable Desktop failover");
+
+            let mut updated = codex_desktop_direct_provider(&original.id, "new-key");
+            updated.name = "Desktop Direct Update".to_string();
+            let error = ProviderService::update(state, AppType::CodexDesktop, None, updated)
+                .expect_err("current Desktop provider must not leave Proxy mode during failover");
+            assert!(
+                error
+                    .to_string()
+                    .contains("请先关闭 Codex Desktop 故障转移"),
+                "unexpected error: {error}"
+            );
+
+            let stored = state
+                .db
+                .get_provider_by_id(&original.id, AppType::CodexDesktop.as_str())
+                .expect("query Desktop provider after rejected update")
+                .expect("Desktop provider remains");
+            assert_eq!(stored.name, original.name);
+            assert_eq!(stored.settings_config, original.settings_config);
+            assert_eq!(
+                stored
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.codex_desktop_mode.clone()),
+                Some(crate::provider::CodexDesktopMode::Proxy)
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
     fn switch_from_managed_codex_official_to_unbound_clears_live_without_backfilling_token() {
         with_test_home(|state, _| {
             crate::settings::reload_settings().expect("reload settings");
@@ -4746,6 +4797,25 @@ impl ProviderService {
             crate::settings::get_effective_current_provider(&state.db, &app_type)?;
         let is_current = effective_current.as_deref() == Some(provider.id.as_str());
 
+        // Codex Desktop failover requires the selected provider to stay on the
+        // gateway data plane.  Editing the current card can otherwise change
+        // it to Direct (or an official card) while leaving the independent
+        // failover flag enabled, so reject that transition before any Live
+        // files or provider rows are mutated.
+        if matches!(app_type, AppType::CodexDesktop)
+            && is_current
+            && state.db.get_codex_desktop_auto_failover_enabled()?
+            && !crate::proxy::provider_router::provider_supports_failover(
+                app_type.as_str(),
+                &provider,
+            )
+        {
+            return Err(AppError::Message(
+                "请先关闭 Codex Desktop 故障转移，再将当前供应商改为 Direct 或官方模式。"
+                    .to_string(),
+            ));
+        }
+
         let existing_managed_codex_account_id = existing_provider
             .as_ref()
             .and_then(Self::managed_codex_oauth_account_id);
@@ -5187,6 +5257,29 @@ impl ProviderService {
         }
 
         if matches!(app_type, AppType::CodexDesktop) {
+            // While Desktop failover is enabled, the shared gateway owns the
+            // live route. Route every eligible target through the catalog-only
+            // hot-switch path so profile/tray callers cannot overwrite
+            // Desktop's auth.json or config.toml. Direct and official targets
+            // remain blocked until the independent failover switch is closed.
+            if state.db.get_codex_desktop_auto_failover_enabled()? {
+                if !crate::proxy::provider_router::provider_supports_failover(
+                    app_type.as_str(),
+                    _provider,
+                ) {
+                    return Err(AppError::Message(
+                        "请先关闭 Codex Desktop 故障转移，再切换到 Direct 或官方供应商。"
+                            .to_string(),
+                    ));
+                }
+                futures::executor::block_on(
+                    state
+                        .proxy_service
+                        .switch_failover_target(app_type.as_str(), id),
+                )
+                .map_err(|e| AppError::Message(format!("故障转移切换失败: {e}")))?;
+                return Ok(SwitchResult::default());
+            }
             let _desktop_switch_guard = futures::executor::block_on(
                 state.proxy_service.lock_switch_for_app(app_type.as_str()),
             );

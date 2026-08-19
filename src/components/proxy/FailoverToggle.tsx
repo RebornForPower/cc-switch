@@ -13,11 +13,11 @@ import {
 import { useProxyStatus } from "@/hooks/useProxyStatus";
 import { cn } from "@/lib/utils";
 import { useTranslation } from "react-i18next";
-import { getAppLabel, type ProxyAppId } from "@/config/appConfig";
+import { getAppLabel, type FailoverAppId } from "@/config/appConfig";
 
 interface FailoverToggleProps {
   className?: string;
-  activeApp: ProxyAppId;
+  activeApp: FailoverAppId;
 }
 
 export function FailoverToggle({ className, activeApp }: FailoverToggleProps) {
@@ -25,8 +25,18 @@ export function FailoverToggle({ className, activeApp }: FailoverToggleProps) {
   const { data: isEnabled = false, isLoading } =
     useAutoFailoverEnabled(activeApp);
   const setEnabled = useSetAutoFailoverEnabled();
-  const { takeoverStatus } = useProxyStatus();
-  const takeoverEnabled = takeoverStatus?.[activeApp] ?? false;
+  const { isRunning, takeoverStatus } = useProxyStatus();
+  // Codex Desktop routes through the shared gateway but deliberately has no
+  // Live takeover row. The gateway being up is its failover readiness state.
+  const takeoverEnabled =
+    activeApp === "codex-desktop"
+      ? isRunning
+      : (takeoverStatus?.[activeApp] ?? false);
+  // A crashed/stopped gateway must not make an enabled Desktop switch
+  // impossible to turn off. Enabling still requires a running gateway; the
+  // exception only keeps the cleanup action available.
+  const canToggle =
+    takeoverEnabled || (activeApp === "codex-desktop" && isEnabled);
 
   const handleToggle = (checked: boolean) => {
     if (checked && !takeoverEnabled) return;
@@ -35,20 +45,29 @@ export function FailoverToggle({ className, activeApp }: FailoverToggleProps) {
 
   const appLabel = getAppLabel(activeApp);
 
-  const tooltipText = !takeoverEnabled
-    ? t("failover.tooltip.takeoverRequired", {
-        app: appLabel,
-        defaultValue: `请先接管 ${appLabel}，再启用故障转移`,
-      })
-    : isEnabled
-      ? t("failover.tooltip.enabled", {
-          app: appLabel,
-          defaultValue: `${appLabel} 故障转移已启用\n按队列优先级（P1→P2→...）选择供应商`,
-        })
-      : t("failover.tooltip.disabled", {
-          app: appLabel,
-          defaultValue: `启用 ${appLabel} 故障转移\n将立即切换到队列 P1，并在失败时自动切换到下一个`,
-        });
+  const tooltipText =
+    !takeoverEnabled && !isEnabled
+      ? t(
+          activeApp === "codex-desktop"
+            ? "failover.tooltip.localRouteRequired"
+            : "failover.tooltip.takeoverRequired",
+          {
+            app: appLabel,
+            defaultValue:
+              activeApp === "codex-desktop"
+                ? `请先开启 ${appLabel} 本地路由，再启用故障转移`
+                : `请先接管 ${appLabel}，再启用故障转移`,
+          },
+        )
+      : isEnabled
+        ? t("failover.tooltip.enabled", {
+            app: appLabel,
+            defaultValue: `${appLabel} 故障转移已启用\n按队列优先级（P1→P2→...）选择供应商`,
+          })
+        : t("failover.tooltip.disabled", {
+            app: appLabel,
+            defaultValue: `启用 ${appLabel} 故障转移\n将立即切换到队列 P1，并在失败时自动切换到下一个`,
+          });
 
   return (
     <div
@@ -73,7 +92,7 @@ export function FailoverToggle({ className, activeApp }: FailoverToggleProps) {
       <Switch
         checked={isEnabled}
         onCheckedChange={handleToggle}
-        disabled={setEnabled.isPending || isLoading || !takeoverEnabled}
+        disabled={setEnabled.isPending || isLoading || !canToggle}
       />
     </div>
   );

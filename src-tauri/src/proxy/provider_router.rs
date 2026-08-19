@@ -7,6 +7,7 @@ use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
 use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerConfig};
+use crate::proxy::types::AppProxyConfig;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -16,6 +17,15 @@ use tokio::sync::RwLock;
 /// header. Reusing that request against another account card would cross the
 /// account boundary, so these cards must never participate in provider retry.
 pub(crate) fn provider_supports_failover(app_type: &str, provider: &Provider) -> bool {
+    if app_type == AppType::CodexDesktop.as_str() {
+        return provider.category.as_deref() != Some("official")
+            && !crate::proxy::providers::is_codex_official_provider(provider)
+            && matches!(
+                crate::codex_desktop_config::provider_mode(provider),
+                crate::provider::CodexDesktopMode::Proxy
+            );
+    }
+
     app_type != AppType::CodexDesktop.as_str()
         && (app_type != AppType::Codex.as_str()
             || !crate::proxy::providers::is_codex_official_provider(provider))
@@ -23,6 +33,89 @@ pub(crate) fn provider_supports_failover(app_type: &str, provider: &Provider) ->
 
 fn app_uses_proxy_config(app_type: &str) -> bool {
     AppType::from_str(app_type).is_ok_and(|app| app.supports_local_proxy())
+}
+
+fn app_uses_failover_settings(app_type: &str) -> bool {
+    AppType::from_str(app_type).is_ok_and(|app| app.supports_failover())
+}
+
+fn default_desktop_failover_config() -> AppProxyConfig {
+    AppProxyConfig {
+        app_type: AppType::CodexDesktop.as_str().to_string(),
+        enabled: true,
+        auto_failover_enabled: true,
+        max_retries: 3,
+        streaming_first_byte_timeout: 60,
+        streaming_idle_timeout: 120,
+        non_streaming_timeout: 600,
+        circuit_failure_threshold: 4,
+        circuit_success_threshold: 2,
+        circuit_timeout_seconds: 60,
+        circuit_error_rate_threshold: 0.6,
+        circuit_min_requests: 10,
+    }
+}
+
+fn default_desktop_circuit_breaker_config() -> CircuitBreakerConfig {
+    CircuitBreakerConfig {
+        failure_threshold: 4,
+        success_threshold: 2,
+        timeout_seconds: 60,
+        error_rate_threshold: 0.6,
+        min_requests: 10,
+    }
+}
+
+/// Load the runtime retry/failover configuration for an app.
+///
+/// Desktop has no `proxy_config` row. When its independent switch is on,
+/// reuse the existing Codex CLI row as the runtime template; a missing or
+/// unreadable row falls back to the same defaults without creating schema
+/// state. When the switch is off, avoid touching `proxy_config` entirely.
+pub(crate) async fn get_runtime_proxy_config(
+    db: &Database,
+    app_type: &str,
+) -> Result<AppProxyConfig, AppError> {
+    if app_type == AppType::CodexDesktop.as_str() {
+        if !db.get_codex_desktop_auto_failover_enabled()? {
+            let mut config = default_desktop_failover_config();
+            config.app_type = app_type.to_string();
+            config.enabled = false;
+            config.auto_failover_enabled = false;
+            config.max_retries = 0;
+            config.streaming_first_byte_timeout = 0;
+            config.streaming_idle_timeout = 0;
+            config.non_streaming_timeout = 0;
+            return Ok(config);
+        }
+
+        let mut config = match db.get_proxy_config_for_app(AppType::Codex.as_str()).await {
+            Ok(config) => config,
+            Err(error) => {
+                log::warn!("[codex-desktop] 读取 Codex CLI 故障转移配置失败，使用默认值: {error}");
+                default_desktop_failover_config()
+            }
+        };
+        config.app_type = app_type.to_string();
+        config.enabled = true;
+        config.auto_failover_enabled = true;
+        return Ok(config);
+    }
+
+    if app_uses_failover_settings(app_type) {
+        return db.get_proxy_config_for_app(app_type).await;
+    }
+
+    Err(AppError::Config(format!(
+        "应用 {app_type} 不支持代理故障转移"
+    )))
+}
+
+fn auto_failover_enabled_sync(db: &Database, app_type: &str) -> Result<bool, AppError> {
+    if app_type == AppType::CodexDesktop.as_str() {
+        return db.get_codex_desktop_auto_failover_enabled();
+    }
+    Ok(false)
 }
 
 /// 供应商路由器
@@ -74,11 +167,14 @@ impl ProviderRouter {
                     false
                 }
             }
+        } else if app_type == AppType::CodexDesktop.as_str() {
+            auto_failover_enabled_sync(&self.db, app_type).unwrap_or(false)
         } else {
             false
         };
 
         if auto_failover_enabled
+            && app_type == AppType::Codex.as_str()
             && current_provider
                 .as_ref()
                 .is_some_and(|provider| !provider_supports_failover(app_type, provider))
@@ -169,6 +265,17 @@ impl ProviderRouter {
                 .await
                 .map(|config| config.circuit_failure_threshold)
                 .unwrap_or(5)
+        } else if app_type == AppType::CodexDesktop.as_str()
+            && self
+                .db
+                .get_codex_desktop_auto_failover_enabled()
+                .unwrap_or(false)
+        {
+            self.db
+                .get_proxy_config_for_app(AppType::Codex.as_str())
+                .await
+                .map(|config| config.circuit_failure_threshold)
+                .unwrap_or_else(|_| default_desktop_circuit_breaker_config().failure_threshold)
         } else {
             5
         };
@@ -298,6 +405,26 @@ impl ProviderRouter {
                 },
                 Err(_) => crate::proxy::circuit_breaker::CircuitBreakerConfig::default(),
             }
+        } else if app_type == AppType::CodexDesktop.as_str()
+            && self
+                .db
+                .get_codex_desktop_auto_failover_enabled()
+                .unwrap_or(false)
+        {
+            match self
+                .db
+                .get_proxy_config_for_app(AppType::Codex.as_str())
+                .await
+            {
+                Ok(app_config) => crate::proxy::circuit_breaker::CircuitBreakerConfig {
+                    failure_threshold: app_config.circuit_failure_threshold,
+                    success_threshold: app_config.circuit_success_threshold,
+                    timeout_seconds: app_config.circuit_timeout_seconds as u64,
+                    error_rate_threshold: app_config.circuit_error_rate_threshold,
+                    min_requests: app_config.circuit_min_requests,
+                },
+                Err(_) => default_desktop_circuit_breaker_config(),
+            }
         } else {
             crate::proxy::circuit_breaker::CircuitBreakerConfig::default()
         };
@@ -313,7 +440,7 @@ impl ProviderRouter {
 mod tests {
     use super::*;
     use crate::database::Database;
-    use crate::provider::{AuthBinding, AuthBindingSource, ProviderMeta};
+    use crate::provider::{AuthBinding, AuthBindingSource, CodexDesktopMode, ProviderMeta};
     use serde_json::json;
     use serial_test::serial;
     use std::env;
@@ -604,6 +731,101 @@ mod tests {
             )
             .await
             .expect("Desktop health recording must use built-in circuit defaults");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn codex_desktop_failover_uses_proxy_queue_and_cli_runtime_defaults() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let proxy_provider = |id: &str, name: &str| {
+            let mut provider = Provider::with_id(
+                id.to_string(),
+                name.to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "key" },
+                    "config": "base_url = \"https://upstream.example/v1\"\n"
+                }),
+                None,
+            );
+            provider.meta = Some(ProviderMeta {
+                codex_desktop_mode: Some(CodexDesktopMode::Proxy),
+                ..Default::default()
+            });
+            provider
+        };
+        let p1 = proxy_provider("desktop-p1", "Desktop P1");
+        let p2 = proxy_provider("desktop-p2", "Desktop P2");
+        db.save_provider(AppType::CodexDesktop.as_str(), &p1)
+            .unwrap();
+        db.save_provider(AppType::CodexDesktop.as_str(), &p2)
+            .unwrap();
+        db.set_current_provider(AppType::CodexDesktop.as_str(), &p1.id)
+            .unwrap();
+        db.add_to_failover_queue(AppType::CodexDesktop.as_str(), &p1.id)
+            .unwrap();
+        db.add_to_failover_queue(AppType::CodexDesktop.as_str(), &p2.id)
+            .unwrap();
+
+        let mut cli_config = db
+            .get_proxy_config_for_app(AppType::Codex.as_str())
+            .await
+            .unwrap();
+        cli_config.max_retries = 7;
+        cli_config.streaming_first_byte_timeout = 71;
+        cli_config.streaming_idle_timeout = 121;
+        cli_config.non_streaming_timeout = 601;
+        db.update_proxy_config_for_app(cli_config).await.unwrap();
+        db.set_codex_desktop_auto_failover_enabled(true).unwrap();
+
+        let runtime = get_runtime_proxy_config(&db, AppType::CodexDesktop.as_str())
+            .await
+            .unwrap();
+        assert_eq!(runtime.max_retries, 7);
+        assert_eq!(runtime.streaming_first_byte_timeout, 71);
+        assert!(runtime.auto_failover_enabled);
+
+        let selected = ProviderRouter::new(db)
+            .select_providers(AppType::CodexDesktop.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![p1.id.as_str(), p2.id.as_str()]
+        );
+    }
+
+    #[test]
+    fn codex_desktop_failover_rejects_direct_and_official_providers() {
+        let mut direct = Provider::with_id("direct".into(), "Direct".into(), json!({}), None);
+        direct.meta = Some(ProviderMeta {
+            codex_desktop_mode: Some(CodexDesktopMode::Direct),
+            ..Default::default()
+        });
+        assert!(!provider_supports_failover(
+            AppType::CodexDesktop.as_str(),
+            &direct
+        ));
+
+        let mut official = Provider::with_id(
+            "official".into(),
+            "Official".into(),
+            json!({ "auth": {}, "config": "" }),
+            None,
+        );
+        official.category = Some("official".into());
+        official.meta = Some(ProviderMeta {
+            codex_desktop_mode: Some(CodexDesktopMode::Proxy),
+            ..Default::default()
+        });
+        assert!(!provider_supports_failover(
+            AppType::CodexDesktop.as_str(),
+            &official
+        ));
     }
 
     #[tokio::test]

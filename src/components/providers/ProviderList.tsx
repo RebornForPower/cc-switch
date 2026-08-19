@@ -48,7 +48,8 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { isTextEditableTarget } from "@/utils/domUtils";
 import { usePiCurrentState } from "@/lib/query/pi";
-import { isProxyAppId } from "@/config/appConfig";
+import { isFailoverAppId } from "@/config/appConfig";
+import { codexDesktopProviderSupportsFailover } from "@/utils/providerCapabilities";
 
 interface ProviderListProps {
   providers: Record<string, Provider>;
@@ -148,9 +149,9 @@ export function ProviderList({
     [appId, openclawDefaultModel],
   );
 
-  // Only apps with an explicit local-routing capability participate in
-  // failover. Additive apps such as Pi never query or render this state.
-  const supportsFailover = isProxyAppId(appId);
+  // Desktop uses the shared gateway but has an independent failover switch;
+  // additive apps such as Pi never query or render this state.
+  const supportsFailover = isFailoverAppId(appId);
   const { data: isAutoFailoverEnabled } = useAutoFailoverEnabled(
     appId,
     supportsFailover,
@@ -161,8 +162,20 @@ export function ProviderList({
 
   const isFailoverModeActive =
     supportsFailover &&
-    isProxyTakeover === true &&
-    isAutoFailoverEnabled === true;
+    isAutoFailoverEnabled === true &&
+    (appId === "codex-desktop"
+      ? isProxyRunning === true
+      : isProxyTakeover === true);
+
+  // Codex Desktop direct and official cards must remain ordinary "启用"
+  // actions. Only its proxy-mode third-party cards can join the queue.
+  const supportsProviderFailover = useCallback(
+    (provider: Provider): boolean => {
+      if (appId !== "codex-desktop") return true;
+      return codexDesktopProviderSupportsFailover(provider);
+    },
+    [appId],
+  );
 
   const isOpenCode = appId === "opencode";
   const { data: currentOmoId } = useCurrentOmoProviderId(isOpenCode);
@@ -539,6 +552,8 @@ export function ProviderList({
                     : appId === "hermes"
                       ? isHermesCurrent
                       : provider.id === currentProviderId;
+            const providerFailoverEnabled =
+              isFailoverModeActive && supportsProviderFailover(provider);
             return (
               <SortableProviderCard
                 key={provider.id}
@@ -566,11 +581,17 @@ export function ProviderList({
                 isTesting={isChecking(provider.id)}
                 isProxyRunning={supportsFailover && isProxyRunning}
                 isProxyTakeover={supportsFailover && isProxyTakeover}
-                isAutoFailoverEnabled={isFailoverModeActive}
-                failoverPriority={getFailoverPriority(provider.id)}
-                isInFailoverQueue={isInFailoverQueue(provider.id)}
+                isAutoFailoverEnabled={providerFailoverEnabled}
+                failoverPriority={
+                  providerFailoverEnabled
+                    ? getFailoverPriority(provider.id)
+                    : undefined
+                }
+                isInFailoverQueue={
+                  providerFailoverEnabled && isInFailoverQueue(provider.id)
+                }
                 onToggleFailover={
-                  supportsFailover
+                  providerFailoverEnabled
                     ? (enabled) => handleToggleFailover(provider.id, enabled)
                     : undefined
                 }

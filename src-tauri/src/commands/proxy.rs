@@ -17,6 +17,15 @@ fn require_proxy_app(app_type: &str) -> Result<crate::app_config::AppType, Strin
     Ok(app)
 }
 
+fn require_failover_health_app(app_type: &str) -> Result<crate::app_config::AppType, String> {
+    let app = crate::app_config::AppType::from_str(app_type)
+        .map_err(|error| format!("无效的应用类型: {error}"))?;
+    if !app.supports_failover() {
+        return Err(format!("{} 不支持故障转移", app.as_str()));
+    }
+    Ok(app)
+}
+
 /// 启动代理服务器（仅启动服务，不接管 Live 配置）
 #[tauri::command]
 pub async fn start_proxy_server(
@@ -28,20 +37,7 @@ pub async fn start_proxy_server(
 /// 停止代理服务器（仅停止服务，不恢复/清理 Live 接管状态）
 #[tauri::command]
 pub async fn stop_proxy_server(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let takeover = state.proxy_service.get_takeover_status().await?;
-    if takeover.claude
-        || takeover.codex
-        || takeover.gemini
-        || takeover.grokbuild
-        || takeover.opencode
-        || takeover.openclaw
-    {
-        return Err(
-            "仍有应用处于代理接管状态，请先在设置中关闭对应应用接管后再停止本地路由。".to_string(),
-        );
-    }
-
-    state.proxy_service.stop().await
+    state.proxy_service.stop_for_manual_request().await
 }
 
 /// 停止代理服务器（恢复 Live 配置）
@@ -155,8 +151,27 @@ pub async fn update_proxy_config_for_app(
 
     state
         .proxy_service
-        .update_circuit_breaker_config_for_app(&app_type, circuit_config)
-        .await
+        .update_circuit_breaker_config_for_app(&app_type, circuit_config.clone())
+        .await?;
+
+    // Codex Desktop has no proxy_config row; its enabled failover path reuses
+    // the Codex CLI circuit settings. Keep already-created Desktop breakers
+    // in sync when those shared settings are updated.
+    if app_type == crate::app_config::AppType::Codex.as_str()
+        && db
+            .get_codex_desktop_auto_failover_enabled()
+            .map_err(|e| e.to_string())?
+    {
+        state
+            .proxy_service
+            .update_circuit_breaker_config_for_app(
+                crate::app_config::AppType::CodexDesktop.as_str(),
+                circuit_config,
+            )
+            .await?;
+    }
+
+    Ok(())
 }
 
 async fn get_default_cost_multiplier_internal(
@@ -324,7 +339,7 @@ pub async fn get_provider_health(
     provider_id: String,
     app_type: String,
 ) -> Result<ProviderHealth, String> {
-    require_proxy_app(&app_type)?;
+    require_failover_health_app(&app_type)?;
     let db = &state.db;
     db.get_provider_health(&provider_id, &app_type)
         .await
@@ -343,7 +358,7 @@ pub async fn reset_circuit_breaker(
     provider_id: String,
     app_type: String,
 ) -> Result<(), String> {
-    require_proxy_app(&app_type)?;
+    let app = require_failover_health_app(&app_type)?;
     // 1. 重置数据库健康状态
     let db = &state.db;
     db.update_provider_health(&provider_id, &app_type, true, None)
@@ -356,27 +371,49 @@ pub async fn reset_circuit_breaker(
         .reset_provider_circuit_breaker(&provider_id, &app_type)
         .await?;
 
-    // 3. 检查是否应该切回优先级更高的供应商（从 proxy_config 表读取）
-    // 只有当该应用已被代理接管（enabled=true）且开启了自动故障转移时才执行
-    let (app_enabled, auto_failover_enabled) = match db.get_proxy_config_for_app(&app_type).await {
-        Ok(config) => (config.enabled, config.auto_failover_enabled),
-        Err(e) => {
-            log::error!("[{app_type}] Failed to read proxy_config: {e}, defaulting to disabled");
-            (false, false)
-        }
-    };
+    // 3. 检查是否应该切回优先级更高的供应商。Desktop 没有
+    // proxy_config 行：本地路由运行状态和 settings flag 共同决定。
+    let (app_enabled, auto_failover_enabled) =
+        if matches!(&app, crate::app_config::AppType::CodexDesktop) {
+            (
+                state.proxy_service.is_running().await,
+                db.get_codex_desktop_auto_failover_enabled()
+                    .map_err(|error| error.to_string())?,
+            )
+        } else {
+            match db.get_proxy_config_for_app(&app_type).await {
+                Ok(config) => (config.enabled, config.auto_failover_enabled),
+                Err(e) => {
+                    log::error!(
+                        "[{app_type}] Failed to read proxy_config: {e}, defaulting to disabled"
+                    );
+                    (false, false)
+                }
+            }
+        };
 
     if app_enabled && auto_failover_enabled && state.proxy_service.is_running().await {
         // 获取当前供应商 ID
-        let current_id = db
-            .get_current_provider(&app_type)
-            .map_err(|e| e.to_string())?;
+        let current_id =
+            crate::settings::get_effective_current_provider(db, &app).map_err(|e| e.to_string())?;
 
         if let Some(current_id) = current_id {
             // 获取故障转移队列
             let queue = db
                 .get_failover_queue(&app_type)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|item| {
+                    db.get_provider_by_id(&item.provider_id, &app_type)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|provider| {
+                            crate::proxy::provider_router::provider_supports_failover(
+                                &app_type, &provider,
+                            )
+                        })
+                })
+                .collect::<Vec<_>>();
 
             // 找到恢复的供应商和当前供应商在队列中的位置（使用 sort_index）
             let restored_order = queue
@@ -460,7 +497,7 @@ pub async fn get_circuit_breaker_stats(
     provider_id: String,
     app_type: String,
 ) -> Result<Option<CircuitBreakerStats>, String> {
-    require_proxy_app(&app_type)?;
+    require_failover_health_app(&app_type)?;
     // 这个功能需要访问运行中的代理服务器的内存状态
     // 目前先返回 None，后续可以通过 ProxyService 暴露接口来实现
     let _ = (state, provider_id, app_type);
