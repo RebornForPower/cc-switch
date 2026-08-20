@@ -826,6 +826,28 @@ mod tests {
             AppType::CodexDesktop.as_str(),
             &official
         ));
+
+        // Rows created before `codexDesktopMode` was introduced inherited the
+        // CLI `apiFormat` metadata. They must be treated as Desktop proxy
+        // providers so existing installations can use failover immediately.
+        let mut legacy = Provider::with_id(
+            "legacy".into(),
+            "Legacy".into(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "key" },
+                "config": "model_provider = \"custom\"\n"
+            }),
+            None,
+        );
+        legacy.category = Some("custom".into());
+        legacy.meta = Some(ProviderMeta {
+            api_format: Some("openai_responses".into()),
+            ..Default::default()
+        });
+        assert!(provider_supports_failover(
+            AppType::CodexDesktop.as_str(),
+            &legacy
+        ));
     }
 
     #[tokio::test]

@@ -425,16 +425,23 @@ describe("providerNeedsRouting", () => {
       expect(codexDesktopProviderSupportsFailover(legacy)).toBe(true);
     });
 
-    it("显式 Responses meta 保持 Direct 且不能加入 Desktop 队列", () => {
+    it("只有显式 Desktop mode 才能声明 Direct，旧 Responses meta 仍走网关", () => {
       const native = mkProvider({
         category: "custom",
         meta: { apiFormat: "openai_responses" },
         settingsConfig: { config: codexConfig("responses") },
       });
 
-      expect(resolveCodexDesktopProviderMode(native)).toBe("direct");
-      expect(providerNeedsRouting("codex-desktop", native)).toBe(false);
-      expect(codexDesktopProviderSupportsFailover(native)).toBe(false);
+      expect(resolveCodexDesktopProviderMode(native)).toBe("proxy");
+      expect(providerNeedsRouting("codex-desktop", native)).toBe(true);
+      expect(codexDesktopProviderSupportsFailover(native)).toBe(true);
+
+      expect(
+        resolveCodexDesktopProviderMode({
+          ...native,
+          meta: { apiFormat: "openai_responses", codexDesktopMode: "direct" },
+        }),
+      ).toBe("direct");
     });
   });
 });

@@ -117,9 +117,12 @@ export function resolveCodexDesktopProviderMode(
     return "direct";
   }
 
-  // Rust treats only an explicit meta-level Responses format as Direct.
-  // Legacy rows without it fall back to Proxy even if TOML says `responses`.
-  return provider.meta?.apiFormat === "openai_responses" ? "direct" : "proxy";
+  // `apiFormat` is the Codex CLI upstream protocol, not Desktop's routing
+  // mode.  Legacy Desktop rows copied from the CLI have no explicit
+  // `codexDesktopMode`; route third-party rows through the shared gateway so
+  // they remain eligible for failover.  New rows persist the explicit mode
+  // above, so an intentional direct provider is unaffected.
+  return "proxy";
 }
 
 /** Keep Desktop queue membership aligned with Rust `provider_supports_failover`. */

@@ -43,7 +43,16 @@ pub fn provider_mode(provider: &Provider) -> CodexDesktopMode {
         .as_ref()
         .and_then(|meta| meta.codex_desktop_mode.clone())
         .unwrap_or_else(|| {
-            if is_compatible_direct_provider(provider) {
+            // `codexDesktopMode` was added after the Desktop namespace was
+            // introduced.  Older rows were copied from Codex CLI and may
+            // carry `apiFormat = openai_responses`, which describes the CLI
+            // upstream protocol rather than Desktop's routing mode.  Treat
+            // those legacy third-party rows as gateway-backed so they remain
+            // eligible for Desktop failover.  New writes always persist an
+            // explicit mode, so an intentional direct provider is unchanged.
+            if provider.category.as_deref() == Some("official")
+                || crate::proxy::providers::is_codex_official_provider(provider)
+            {
                 CodexDesktopMode::Direct
             } else {
                 CodexDesktopMode::Proxy
