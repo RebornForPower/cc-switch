@@ -31,11 +31,153 @@ describe("common config snippet saving", () => {
     );
   });
 
+  it("keeps the Codex Desktop target out of the CLI common-config store", async () => {
+    const onConfigChange = vi.fn();
+    const { result } = renderHook(() =>
+      useCodexCommonConfig({
+        codexConfig: 'model = "gpt-5"',
+        onConfigChange,
+        enabled: false,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(getCommonConfigSnippetMock).not.toHaveBeenCalled();
+    expect(result.current.useCommonConfig).toBe(false);
+    expect(result.current.commonConfigSnippet).toBe("");
+
+    await act(async () => {
+      await result.current.handleCommonConfigSnippetChange(
+        'base_url = "https://example.com"',
+      );
+      await result.current.handleCommonConfigToggle(true);
+      await result.current.handleExtract();
+    });
+
+    expect(setCommonConfigSnippetMock).not.toHaveBeenCalled();
+    expect(extractCommonConfigSnippetMock).not.toHaveBeenCalled();
+    expect(onConfigChange).not.toHaveBeenCalled();
+  });
+
+  it("invalidates an in-flight CLI merge when the target becomes Desktop", async () => {
+    getCommonConfigSnippetMock.mockResolvedValue(
+      "[tui]\nnotifications = true\n",
+    );
+    const initialData = { settingsConfig: { config: 'model = "gpt-5"' } };
+    const onConfigChange = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ enabled }: { enabled: boolean }) =>
+        useCodexCommonConfig({
+          codexConfig: 'model = "gpt-5"',
+          onConfigChange,
+          initialData,
+          initialEnabled: false,
+          enabled,
+        }),
+      { initialProps: { enabled: true } },
+    );
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    let resolveMerge: ((value: string) => void) | undefined;
+    updateTomlCommonConfigSnippetMock.mockImplementationOnce(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveMerge = resolve;
+        }),
+    );
+
+    let mergePending: Promise<void> = Promise.resolve();
+    act(() => {
+      mergePending = result.current.handleCommonConfigToggle(true);
+    });
+    rerender({ enabled: false });
+
+    await act(async () => {
+      resolveMerge?.('model = "gpt-5"\n\n[tui]\nnotifications = true\n');
+      await mergePending;
+    });
+
+    expect(result.current.useCommonConfig).toBe(false);
+    expect(result.current.commonConfigSnippet).toBe("");
+    expect(onConfigChange).not.toHaveBeenCalled();
+  });
+
+  it("reloads the CLI snippet before initializing after Desktop is re-enabled", async () => {
+    let resolveLoad: ((value: string) => void) | undefined;
+    getCommonConfigSnippetMock.mockImplementationOnce(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveLoad = resolve;
+        }),
+    );
+    const onConfigChange = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ enabled }: { enabled: boolean }) =>
+        useCodexCommonConfig({
+          codexConfig: 'model = "gpt-5"',
+          onConfigChange,
+          enabled,
+        }),
+      { initialProps: { enabled: false } },
+    );
+
+    expect(result.current.isLoading).toBe(false);
+    rerender({ enabled: true });
+
+    await waitFor(() => expect(result.current.isLoading).toBe(true));
+    expect(updateTomlCommonConfigSnippetMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveLoad?.("[tui]\nnotifications = true\n");
+    });
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    await waitFor(() =>
+      expect(updateTomlCommonConfigSnippetMock).toHaveBeenCalledWith(
+        'model = "gpt-5"',
+        "[tui]\nnotifications = true\n",
+        true,
+      ),
+    );
+  });
+
+  it("does not reuse a stale CLI snippet when the reloaded store is empty", async () => {
+    getCommonConfigSnippetMock
+      .mockResolvedValueOnce("[tui]\nnotifications = true\n")
+      .mockResolvedValueOnce("");
+    const onConfigChange = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ enabled }: { enabled: boolean }) =>
+        useCodexCommonConfig({
+          codexConfig: 'model = "gpt-5"',
+          onConfigChange,
+          initialData: { settingsConfig: { config: 'model = "gpt-5"' } },
+          initialEnabled: false,
+          enabled,
+        }),
+      { initialProps: { enabled: true } },
+    );
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(result.current.commonConfigSnippet).toContain("[tui]");
+
+    rerender({ enabled: false });
+    rerender({ enabled: true });
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(result.current.commonConfigSnippet).not.toContain("[tui]");
+    expect(result.current.useCommonConfig).toBe(false);
+    expect(updateTomlCommonConfigSnippetMock).not.toHaveBeenCalled();
+    expect(onConfigChange).not.toHaveBeenCalled();
+  });
+
   it("does not persist an invalid Codex common config snippet", async () => {
     const onConfigChange = vi.fn();
     const { result } = renderHook(() =>
       useCodexCommonConfig({
-        codexConfig: "model = \"gpt-5\"",
+        codexConfig: 'model = "gpt-5"',
         onConfigChange,
       }),
     );

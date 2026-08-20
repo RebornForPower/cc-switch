@@ -25,8 +25,12 @@ pub use claude::{
     sync_single_server_to_claude,
 };
 pub use codex::{
-    import_from_codex, remove_server_from_codex, sync_enabled_to_codex, sync_single_server_to_codex,
+    capture_codex_mcp_live_snapshot_for, import_from_codex, import_from_codex_for,
+    is_codex_desktop_runtime_mcp_item, is_codex_desktop_runtime_mcp_spec, remove_server_from_codex,
+    sync_enabled_to_codex, sync_single_server_to_codex, write_codex_mcp_projection_for,
+    CodexMcpLiveSnapshot,
 };
+pub(crate) use codex::{ensure_codex_cli_mcp_write_allowed, should_sync_codex_mcp};
 pub use gemini::{
     import_from_gemini, remove_server_from_gemini, sync_enabled_to_gemini,
     sync_single_server_to_gemini,

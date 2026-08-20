@@ -264,7 +264,10 @@ describe("App integration with MSW", () => {
 
     expect(toastErrorMock).not.toHaveBeenCalled();
     expect(toastSuccessMock).toHaveBeenCalled();
-  }, 10_000);
+    // This full provider workflow crosses several MSW-backed mutations. It is
+    // fast in isolation but can exceed the default under the repository's
+    // parallel frontend suite; keep its cleanup from leaking into the next test.
+  }, 20_000);
 
   it("shows the local gateway toggle for Codex Desktop providers", async () => {
     localStorage.setItem("cc-switch-last-app", "codex-desktop");

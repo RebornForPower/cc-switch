@@ -433,15 +433,16 @@ command = "say"
         .get("config")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    // 供应商配置应该包含在 live 文件中
-    // 注意：live 文件还会包含 MCP 同步后的内容
+    // Codex MCP is projected from the database. The live file must not retain
+    // the provider's stale MCP table, while the provider snapshot keeps its
+    // original source text for backward-compatible editing/backfill.
     assert!(
-        config_text.contains("mcp_servers.latest"),
-        "live file should contain provider's original config"
+        !config_text.contains("mcp_servers.latest"),
+        "provider-owned MCP must not be restored into the live file"
     );
     assert!(
         new_config_text.contains("mcp_servers.latest"),
-        "provider snapshot should contain provider's original config"
+        "provider snapshot should retain the original source config"
     );
 
     let legacy = providers

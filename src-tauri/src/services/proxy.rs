@@ -10,6 +10,7 @@ use crate::proxy::providers::codex_oauth_auth::CodexOAuthManager;
 use crate::proxy::server::ProxyServer;
 use crate::proxy::switch_lock::SwitchLockManager;
 use crate::proxy::types::*;
+use crate::services::mcp::{CodexMcpLiveRewritePreflight, McpService};
 use crate::services::provider::{
     build_effective_provider_for_live_with_codex_oauth_manager,
     build_effective_settings_with_common_config,
@@ -826,7 +827,6 @@ impl ProxyService {
         outgoing_managed_account_id: Option<&str>,
         expected_outgoing_refresh_token: Option<&str>,
     ) -> Result<(), String> {
-        let existing_live = self.read_codex_live().ok();
         let mut effective_settings = build_effective_provider_for_live_with_codex_oauth_manager(
             self.db.as_ref(),
             &AppType::Codex,
@@ -835,12 +835,6 @@ impl ProxyService {
         )
         .map_err(|e| format!("构建 codex 有效配置失败: {e}"))?
         .settings_config;
-        if let Some(existing_live) = existing_live.as_ref() {
-            Self::preserve_toml_mcp_servers_from_existing_config(
-                &mut effective_settings,
-                existing_live,
-            )?;
-        }
         let (_, proxy_codex_base_url) = self.build_proxy_urls().await?;
 
         Self::apply_codex_takeover_fields_for_provider(
@@ -1122,6 +1116,13 @@ impl ProxyService {
 
     /// 启动代理服务器（带 Live 配置接管）
     pub async fn start_with_takeover(&self) -> Result<ProxyServerInfo, String> {
+        // Bulk takeover changes backups and the legacy takeover marker before
+        // writing Live. Parse the current Codex MCP state up front so an
+        // invalid TOML file still fails before those state changes occur.
+        if self.read_codex_live().is_ok() {
+            self.ensure_codex_proxy_live_rewrite_allowed()?;
+        }
+
         // 1. 备份各应用的 Live 配置
         self.backup_live_configs().await?;
 
@@ -1254,12 +1255,7 @@ impl ProxyService {
         let _guard = self.switch_locks.lock_for_app(app_type_str).await;
 
         if enabled {
-            // 1) 代理服务未运行则自动启动
-            if !self.is_running().await {
-                self.start().await?;
-            }
-
-            // 2) 已接管则直接返回（幂等）；但如果缺少备份或占位符残留，需要重建接管
+            // 1) 已接管且 Live/备份完整时无需重写；异常状态才重建。
             let current_config = self
                 .db
                 .get_proxy_config_for_app(app_type_str)
@@ -1267,6 +1263,7 @@ impl ProxyService {
                 .map_err(|e| format!("获取 {app_type_str} 配置失败: {e}"))?;
 
             let mut restore_existing_backup_before_takeover = false;
+            let mut live_rewrite_required = true;
             if current_config.enabled {
                 let has_backup = match self.db.get_live_backup(app_type_str).await {
                     Ok(v) => v.is_some(),
@@ -1288,14 +1285,28 @@ impl ProxyService {
                 // 只看占位符会把半接管/旧端口残留误判为可复用，导致开启接管后
                 // live 文件仍停留在普通供应商配置。
                 if has_backup && live_matches_current_proxy {
-                    self.refresh_active_target_from_current_provider(&app).await;
-                    return Ok(());
-                }
-                restore_existing_backup_before_takeover = has_backup;
+                    live_rewrite_required = false;
+                } else {
+                    restore_existing_backup_before_takeover = has_backup;
 
-                log::warn!(
-                    "{app_type_str} 标记为已接管，但 backup={has_backup} live_matches_current_proxy={live_matches_current_proxy}，正在重新接管并补齐 Live"
-                );
+                    log::warn!(
+                        "{app_type_str} 标记为已接管，但 backup={has_backup} live_matches_current_proxy={live_matches_current_proxy}，正在重新接管并补齐 Live"
+                    );
+                }
+            }
+
+            if live_rewrite_required && matches!(&app, AppType::Codex) {
+                self.ensure_codex_proxy_live_rewrite_allowed()?;
+            }
+
+            // 2) 代理服务未运行则自动启动。需要重写时，Codex MCP 预检已
+            // 在启动服务之前完成；完整的幂等接管只恢复运行态，不触碰 Live。
+            if !self.is_running().await {
+                self.start().await?;
+            }
+            if !live_rewrite_required {
+                self.refresh_active_target_from_current_provider(&app).await;
+                return Ok(());
             }
 
             // 3) 备份 Live 配置（严格：目标 app 不存在则报错）
@@ -1418,6 +1429,10 @@ impl ProxyService {
             return Ok(()); // 未接管，幂等返回
         }
 
+        if matches!(&app, AppType::Codex) {
+            self.ensure_codex_proxy_live_rewrite_allowed_for_restore()?;
+        }
+
         // 1) 恢复 Live 配置
         //
         // 必须走 with_fallback 版本：备份 → SSOT → 清理占位符 的三层兜底。
@@ -1481,6 +1496,10 @@ impl ProxyService {
     /// 代理或程序退出时会自然停止。
     pub fn disable_takeover_for_app_sync(&self, app_type: &AppType) -> Result<(), String> {
         let app_type_str = app_type.as_str();
+
+        if matches!(app_type, &AppType::Codex) {
+            self.ensure_codex_proxy_live_rewrite_allowed_for_restore()?;
+        }
 
         // 1) 恢复原始 Live 配置（备份 → SSOT → 清理占位符 三层兜底）
         futures::executor::block_on(self.restore_live_config_for_app_with_fallback_inner(app_type))
@@ -1951,6 +1970,12 @@ impl ProxyService {
                 log::warn!("codex Live 已被代理接管，不备份（避免把代理配置固化进备份槽）；下次 stop 会从 SSOT 重建 Live");
             } else {
                 self.strip_current_official_codex_auth_from_backup(&mut config)?;
+                // MCP belongs to the CLI database projection. In particular,
+                // a shared config.toml can contain Codex Desktop's runtime
+                // node_repl entry, which must not be persisted in a provider
+                // takeover backup and later mistaken for CLI state.
+                crate::codex_config::strip_codex_mcp_servers_from_settings(&mut config)
+                    .map_err(|error| format!("清理 Codex 备份中的 MCP 配置失败: {error}"))?;
                 let json_str = serde_json::to_string(&config)
                     .map_err(|e| format!("序列化 Codex 配置失败: {e}"))?;
                 self.db
@@ -2013,6 +2038,11 @@ impl ProxyService {
 
         if matches!(app_type, AppType::Codex) {
             self.strip_current_official_codex_auth_from_backup(&mut config)?;
+            // Keep both bulk and per-app takeover backups free of the live
+            // MCP projection. Desktop runtime entries are preserved from the
+            // physical file during the later MCP-aware restore instead.
+            crate::codex_config::strip_codex_mcp_servers_from_settings(&mut config)
+                .map_err(|error| format!("清理 Codex 备份中的 MCP 配置失败: {error}"))?;
         }
 
         let json_str = serde_json::to_string(&config)
@@ -2328,6 +2358,7 @@ impl ProxyService {
             }
             AppType::Codex => {
                 if let Ok(Some(backup)) = self.db.get_live_backup("codex").await {
+                    self.ensure_codex_proxy_live_rewrite_allowed_for_restore()?;
                     let config: Value = serde_json::from_str(&backup.original_config)
                         .map_err(|e| format!("解析 Codex 备份失败: {e}"))?;
                     self.write_codex_restore_backup(&config)?;
@@ -2358,6 +2389,19 @@ impl ProxyService {
 
     /// 恢复原始 Live 配置
     async fn restore_live_configs(&self) -> Result<(), String> {
+        let codex_has_backup = self
+            .db
+            .get_live_backup(AppType::Codex.as_str())
+            .await
+            .map_err(|error| format!("获取 codex Live 备份失败: {error}"))?
+            .is_some();
+        if codex_has_backup || self.detect_takeover_in_live_config_for_app(&AppType::Codex) {
+            // The loop restores Claude before Codex. Parse the Codex MCP state
+            // up front so restore can proceed even when the current TOML is
+            // malformed, without partially mutating other apps.
+            self.ensure_codex_proxy_live_rewrite_allowed_for_restore()?;
+        }
+
         let mut errors = Vec::new();
 
         for app_type in [
@@ -2402,6 +2446,11 @@ impl ProxyService {
             .get_live_backup(app_type_str)
             .await
             .map_err(|e| format!("获取 {app_type_str} Live 备份失败: {e}"))?;
+        if matches!(app_type, &AppType::Codex)
+            && (backup.is_some() || self.detect_takeover_in_live_config_for_app(app_type))
+        {
+            self.ensure_codex_proxy_live_rewrite_allowed_for_restore()?;
+        }
         if let Some(backup) = backup {
             let config: Value = serde_json::from_str(&backup.original_config)
                 .map_err(|e| format!("解析 {app_type_str} 备份失败: {e}"))?;
@@ -2945,10 +2994,6 @@ impl ProxyService {
                 existing_backup_value.or_else(|| self.read_codex_live().ok());
 
             if let Some(existing_value) = existing_backup_value.as_ref() {
-                Self::preserve_toml_mcp_servers_from_existing_config(
-                    &mut effective_settings,
-                    existing_value,
-                )?;
                 if let Some(account_id) = clear_codex_auth_for_account {
                     Self::clear_codex_auth_in_backup(
                         &mut effective_settings,
@@ -2968,6 +3013,13 @@ impl ProxyService {
                     )?;
                 }
             }
+
+            // A takeover backup is provider state, not an MCP snapshot. Codex
+            // CLI MCP is restored from the database preflight when this backup
+            // is eventually written to Live; keeping a file-derived table here
+            // would also preserve Desktop runtime entries indefinitely.
+            crate::codex_config::strip_codex_mcp_servers_from_settings(&mut effective_settings)
+                .map_err(|error| format!("清理 Codex 备份中的 MCP 配置失败: {error}"))?;
 
             // 统一会话开关：备份是接管释放时恢复 live 的来源，官方配置的
             // 共享 custom 路由注入必须落在备份里，否则恢复后开关失效。
@@ -3115,6 +3167,12 @@ impl ProxyService {
             .is_some();
         let live_taken_over = self.detect_takeover_in_live_config_for_app(&app_type_enum);
         let should_sync_backup = has_backup || live_taken_over;
+        if should_sync_backup && matches!(&app_type_enum, AppType::Codex) {
+            // The hot-switch preparation updates the backup and can rotate
+            // managed auth before it rewrites Live. Parse MCP before either
+            // state is touched so malformed TOML fails atomically.
+            self.ensure_codex_proxy_live_rewrite_allowed()?;
+        }
         let outgoing_live_refresh_token =
             if should_sync_backup && matches!(app_type_enum, AppType::Codex) {
                 match outgoing_managed_codex_account_id.as_deref() {
@@ -3186,10 +3244,6 @@ impl ProxyService {
                     )
                     .map_err(|e| format!("构建 Codex 有效配置失败: {e}"))?;
                 let effective_settings = &effective_provider.settings_config;
-                let auth = effective_settings
-                    .get("auth")
-                    .ok_or_else(|| "Codex 供应商缺少 auth 配置".to_string())?;
-                let config_str = effective_settings.get("config").and_then(|v| v.as_str());
                 let profile = crate::proxy::providers::resolve_codex_catalog_tool_profile(
                     &effective_provider,
                 );
@@ -3205,18 +3259,37 @@ impl ProxyService {
                     .map_err(|error| error.to_string())?;
                 }
 
-                crate::codex_config::write_codex_provider_live_with_catalog(
-                    effective_settings,
-                    effective_provider.category.as_deref(),
-                    auth,
-                    config_str,
-                    profile,
-                )
-                .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
-                if target_managed_codex_account_id.is_some() {
-                    crate::codex_config::record_codex_managed_oauth_live_auth(auth)
-                        .map_err(|error| format!("记录 Codex 托管认证标记失败: {error}"))?;
-                }
+                self.rewrite_codex_live_with_mcp_for_provider(effective_settings, |sanitized, config_was_mcp_only| {
+                    let auth = sanitized
+                        .get("auth")
+                        .ok_or_else(|| "Codex 供应商缺少 auth 配置".to_string())?;
+                    let config_str = sanitized.get("config").and_then(|value| value.as_str());
+                    let write_result = if config_was_mcp_only {
+                        crate::codex_config::write_codex_provider_live_with_catalog_after_mcp_strip(
+                            crate::codex_config::CodexTarget::Cli,
+                            sanitized,
+                            effective_provider.category.as_deref(),
+                            auth,
+                            config_str,
+                            profile,
+                        )
+                    } else {
+                        crate::codex_config::write_codex_provider_live_with_catalog(
+                            sanitized,
+                            effective_provider.category.as_deref(),
+                            auth,
+                            config_str,
+                            profile,
+                        )
+                    };
+                    write_result
+                    .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
+                    if target_managed_codex_account_id.is_some() {
+                        crate::codex_config::record_codex_managed_oauth_live_auth(auth)
+                            .map_err(|error| format!("记录 Codex 托管认证标记失败: {error}"))?;
+                    }
+                    Ok(())
+                })?;
             }
 
             if should_sync_backup && matches!(app_type_enum, AppType::Codex) {
@@ -3647,20 +3720,160 @@ impl ProxyService {
             .map_err(|e| format!("读取 Codex Live 配置失败: {e}"))
     }
 
+    fn preflight_codex_proxy_live_rewrite(&self) -> Result<CodexMcpLiveRewritePreflight, String> {
+        McpService::preflight_codex_live_rewrite_with_db(self.db.as_ref())
+            .map_err(|error| format!("Codex CLI MCP 写入预检失败: {error}"))
+    }
+
+    fn ensure_codex_proxy_live_rewrite_allowed(&self) -> Result<(), String> {
+        let _ = self.preflight_codex_proxy_live_rewrite()?;
+        Ok(())
+    }
+
+    /// Restore may need to replace a malformed current `config.toml` with the
+    /// known-good takeover backup. Keep this tolerance scoped to restore; all
+    /// ordinary provider/MCP rewrites continue using the strict preflight.
+    fn preflight_codex_proxy_live_rewrite_for_restore(
+        &self,
+    ) -> Result<CodexMcpLiveRewritePreflight, String> {
+        McpService::preflight_codex_live_rewrite_for_restore_with_db(self.db.as_ref())
+            .map_err(|error| format!("Codex CLI MCP 恢复预检失败: {error}"))
+    }
+
+    fn ensure_codex_proxy_live_rewrite_allowed_for_restore(&self) -> Result<(), String> {
+        let _ = self.preflight_codex_proxy_live_rewrite_for_restore()?;
+        Ok(())
+    }
+
+    fn rollback_codex_proxy_live_rewrite(
+        snapshot: &crate::codex_config::CodexLiveStateSnapshot,
+        error: String,
+    ) -> Result<(), String> {
+        match snapshot.restore_preserving_newer_same_account_auth() {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(format!(
+                "{error}; 回滚 Codex Live 配置失败: {rollback_error}"
+            )),
+        }
+    }
+
+    /// Commit a whole-file Codex CLI rewrite as one MCP-aware transaction.
+    ///
+    /// Provider/backup payloads never own `[mcp_servers]`. The table is removed
+    /// before the write and reconstructed only from the preflight DB snapshot.
+    /// If either the physical write or that projection fails, the exact
+    /// pre-write config/catalog state is restored (while retaining a provably
+    /// newer refresh generation for the same ChatGPT account).
+    fn rewrite_codex_live_with_mcp<F>(&self, config: &Value, write: F) -> Result<(), String>
+    where
+        F: FnOnce(&Value) -> Result<(), String>,
+    {
+        let preflight = self.preflight_codex_proxy_live_rewrite()?;
+        self.rewrite_codex_live_with_mcp_preflight(config, preflight, write)
+    }
+
+    fn rewrite_codex_live_with_mcp_for_provider<F>(
+        &self,
+        config: &Value,
+        write: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(&Value, bool) -> Result<(), String>,
+    {
+        let preflight = self.preflight_codex_proxy_live_rewrite()?;
+        let snapshot = crate::codex_config::CodexLiveStateSnapshot::capture()
+            .map_err(|error| format!("捕获 Codex Live 写入前状态失败: {error}"))?;
+        let mut sanitized = config.clone();
+        let had_config_before_mcp_strip = sanitized
+            .get("config")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty());
+        let mcp_was_stripped =
+            crate::codex_config::strip_codex_mcp_servers_from_settings(&mut sanitized)
+                .map_err(|error| format!("清理 Codex 供应商 MCP 配置失败: {error}"))?;
+        let config_was_mcp_only = had_config_before_mcp_strip
+            && mcp_was_stripped
+            && sanitized
+                .get("config")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.trim().is_empty());
+
+        if let Err(error) = write(&sanitized, config_was_mcp_only) {
+            return Self::rollback_codex_proxy_live_rewrite(&snapshot, error);
+        }
+
+        if let Err(error) =
+            McpService::sync_codex_after_live_rewrite_with_db(self.db.as_ref(), preflight)
+        {
+            return Self::rollback_codex_proxy_live_rewrite(
+                &snapshot,
+                format!("重投影 Codex CLI MCP 失败: {error}"),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn rewrite_codex_live_with_mcp_preflight<F>(
+        &self,
+        config: &Value,
+        preflight: CodexMcpLiveRewritePreflight,
+        write: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(&Value) -> Result<(), String>,
+    {
+        let snapshot = crate::codex_config::CodexLiveStateSnapshot::capture()
+            .map_err(|error| format!("捕获 Codex Live 写入前状态失败: {error}"))?;
+        let mut sanitized = config.clone();
+        crate::codex_config::strip_codex_mcp_servers_from_settings(&mut sanitized)
+            .map_err(|error| format!("清理 Codex 供应商 MCP 配置失败: {error}"))?;
+
+        if let Err(error) = write(&sanitized) {
+            return Self::rollback_codex_proxy_live_rewrite(&snapshot, error);
+        }
+
+        if let Err(error) =
+            McpService::sync_codex_after_live_rewrite_with_db(self.db.as_ref(), preflight)
+        {
+            return Self::rollback_codex_proxy_live_rewrite(
+                &snapshot,
+                format!("重投影 Codex CLI MCP 失败: {error}"),
+            );
+        }
+
+        Ok(())
+    }
+
     fn write_codex_live(&self, config: &Value) -> Result<(), String> {
         self.write_codex_live_verbatim(config)
     }
 
     fn write_codex_restore_backup(&self, config: &Value) -> Result<(), String> {
+        let preflight = self.preflight_codex_proxy_live_rewrite_for_restore()?;
         let mut config = config.clone();
         let auth_snapshot = self.preserve_codex_oauth_login_on_restore(&mut config)?;
-        self.write_codex_live_verbatim_with_auth_guard(&config, Some(&auth_snapshot))
+        self.rewrite_codex_live_with_mcp_preflight(&config, preflight, |sanitized| {
+            self.write_codex_live_verbatim_with_auth_guard_raw(sanitized, Some(&auth_snapshot))
+        })
     }
 
+    #[cfg(test)]
     fn write_codex_live_for_provider(
         &self,
         config: &Value,
         provider: Option<&Provider>,
+    ) -> Result<(), String> {
+        self.rewrite_codex_live_with_mcp_for_provider(config, |sanitized, config_was_mcp_only| {
+            self.write_codex_live_for_provider_raw(sanitized, provider, config_was_mcp_only)
+        })
+    }
+
+    fn write_codex_live_for_provider_raw(
+        &self,
+        config: &Value,
+        provider: Option<&Provider>,
+        config_was_mcp_only: bool,
     ) -> Result<(), String> {
         let Some(provider) = provider else {
             if crate::settings::preserve_codex_official_auth_on_switch() {
@@ -3671,9 +3884,15 @@ impl ProxyService {
                     if auth.get("OPENAI_API_KEY").and_then(|v| v.as_str())
                         == Some(PROXY_TOKEN_PLACEHOLDER)
                     {
-                        let live_config = crate::codex_config::prepare_codex_provider_live_config(
-                            auth, config_str,
-                        )
+                        let live_config = if config_was_mcp_only {
+                            crate::codex_config::prepare_codex_provider_live_config_after_mcp_strip(
+                                auth, config_str,
+                            )
+                        } else {
+                            crate::codex_config::prepare_codex_provider_live_config(
+                                auth, config_str,
+                            )
+                        }
                         .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
                         crate::codex_config::write_codex_live_config_atomic(Some(&live_config))
                             .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
@@ -3682,7 +3901,7 @@ impl ProxyService {
                 }
             }
 
-            return self.write_codex_live_verbatim(config);
+            return self.write_codex_live_verbatim_with_auth_guard_raw(config, None);
         };
 
         let auth = config
@@ -3691,14 +3910,25 @@ impl ProxyService {
         let config_str = config.get("config").and_then(|v| v.as_str());
         let profile = crate::proxy::providers::resolve_codex_catalog_tool_profile(provider);
 
-        crate::codex_config::write_codex_provider_live_with_catalog(
-            config,
-            provider.category.as_deref(),
-            auth,
-            config_str,
-            profile,
-        )
-        .map_err(|e| format!("写入 Codex 配置失败: {e}"))
+        let write_result = if config_was_mcp_only {
+            crate::codex_config::write_codex_provider_live_with_catalog_after_mcp_strip(
+                crate::codex_config::CodexTarget::Cli,
+                config,
+                provider.category.as_deref(),
+                auth,
+                config_str,
+                profile,
+            )
+        } else {
+            crate::codex_config::write_codex_provider_live_with_catalog(
+                config,
+                provider.category.as_deref(),
+                auth,
+                config_str,
+                profile,
+            )
+        };
+        write_result.map_err(|e| format!("写入 Codex 配置失败: {e}"))
     }
 
     fn codex_auth_has_proxy_placeholder(auth: &Value) -> bool {
@@ -3709,6 +3939,21 @@ impl ProxyService {
         &self,
         config: &Value,
         provider: Option<&Provider>,
+    ) -> Result<(), String> {
+        self.rewrite_codex_live_with_mcp_for_provider(config, |sanitized, config_was_mcp_only| {
+            self.write_codex_takeover_live_for_provider_raw(
+                sanitized,
+                provider,
+                config_was_mcp_only,
+            )
+        })
+    }
+
+    fn write_codex_takeover_live_for_provider_raw(
+        &self,
+        config: &Value,
+        provider: Option<&Provider>,
+        config_was_mcp_only: bool,
     ) -> Result<(), String> {
         let official_passthrough =
             provider.is_some_and(crate::proxy::providers::is_codex_official_provider);
@@ -3755,10 +4000,15 @@ impl ProxyService {
             let live_config = if official_passthrough {
                 prepared_config
             } else {
-                crate::codex_config::prepare_codex_provider_live_config(
-                    config.get("auth").unwrap_or(&Value::Null),
-                    &prepared_config,
-                )
+                let auth = config.get("auth").unwrap_or(&Value::Null);
+                if config_was_mcp_only {
+                    crate::codex_config::prepare_codex_provider_live_config_after_mcp_strip(
+                        auth,
+                        &prepared_config,
+                    )
+                } else {
+                    crate::codex_config::prepare_codex_provider_live_config(auth, &prepared_config)
+                }
                 .map_err(|e| format!("写入 Codex 配置失败: {e}"))?
             };
             crate::codex_config::write_codex_live_config_atomic(Some(&live_config))
@@ -3766,7 +4016,7 @@ impl ProxyService {
             return Ok(());
         }
 
-        self.write_codex_live_for_provider(config, provider)
+        self.write_codex_live_for_provider_raw(config, provider, config_was_mcp_only)
     }
 
     fn write_codex_live_verbatim(&self, config: &Value) -> Result<(), String> {
@@ -3774,6 +4024,16 @@ impl ProxyService {
     }
 
     fn write_codex_live_verbatim_with_auth_guard(
+        &self,
+        config: &Value,
+        expected_auth: Option<&CodexAuthFileSnapshot>,
+    ) -> Result<(), String> {
+        self.rewrite_codex_live_with_mcp(config, |sanitized| {
+            self.write_codex_live_verbatim_with_auth_guard_raw(sanitized, expected_auth)
+        })
+    }
+
+    fn write_codex_live_verbatim_with_auth_guard_raw(
         &self,
         config: &Value,
         expected_auth: Option<&CodexAuthFileSnapshot>,
@@ -3976,6 +4236,22 @@ impl ProxyService {
         let mut new_config = config.clone();
         new_config.live_takeover_active = previous.live_takeover_active;
 
+        let require_restart = new_config.listen_address != previous.listen_address
+            || new_config.listen_port != previous.listen_port;
+        if require_restart && self.is_running().await {
+            let codex_proxy_config = self
+                .db
+                .get_proxy_config_for_app(AppType::Codex.as_str())
+                .await
+                .map_err(|error| format!("获取 codex 接管配置失败: {error}"))?;
+            if codex_proxy_config.enabled {
+                // Restart changes DB/server state before the enabled Live files
+                // are reprojected to the new address. Fail a Codex MCP ownership
+                // conflict before committing either change.
+                self.ensure_codex_proxy_live_rewrite_allowed()?;
+            }
+        }
+
         self.db
             .update_proxy_config(new_config.clone())
             .await
@@ -3988,9 +4264,6 @@ impl ProxyService {
         }
 
         // 判断是否需要重启（地址或端口变更）
-        let require_restart = new_config.listen_address != previous.listen_address
-            || new_config.listen_port != previous.listen_port;
-
         if require_restart {
             if let Some(server) = server_guard.take() {
                 server
@@ -4104,6 +4377,7 @@ impl ProxyService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_config::{McpApps, McpServer};
     use crate::provider::{AuthBinding, AuthBindingSource, ProviderMeta};
     use serial_test::serial;
     use std::env;
@@ -4213,6 +4487,40 @@ mod tests {
             .expect("serialize models_cache"),
         )
         .expect("write models_cache.json");
+    }
+
+    fn configure_distinct_codex_test_targets() -> std::path::PathBuf {
+        let home = std::path::PathBuf::from(
+            env::var("CC_SWITCH_TEST_HOME").expect("temporary test home must be configured"),
+        );
+        let desktop_dir = home.join(".codex-desktop-test");
+        crate::settings::update_settings(crate::settings::AppSettings {
+            codex_desktop_config_dir: Some(desktop_dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .expect("configure a distinct Codex Desktop directory");
+        std::fs::create_dir_all(&desktop_dir).expect("create Codex Desktop test directory");
+        desktop_dir
+    }
+
+    fn save_codex_mcp_server(db: &Database, id: &str, command: &str) {
+        db.save_mcp_server(&McpServer {
+            id: id.to_string(),
+            name: id.to_string(),
+            server: json!({
+                "type": "stdio",
+                "command": command,
+            }),
+            apps: McpApps {
+                codex: true,
+                ..Default::default()
+            },
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        })
+        .expect("save Codex MCP server");
     }
 
     #[test]
@@ -7900,7 +8208,432 @@ wire_api = "responses"
 
     #[tokio::test]
     #[serial]
-    async fn update_live_backup_from_provider_preserves_codex_mcp_servers() {
+    async fn codex_takeover_and_restore_project_only_database_owned_cli_mcp() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        let desktop_dir = configure_distinct_codex_test_targets();
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+        save_codex_mcp_server(db.as_ref(), "cli-owned", "cli-command");
+
+        let initial_cli = r#"model_provider = "vendor"
+model = "gpt-test"
+
+[model_providers.vendor]
+name = "Vendor"
+base_url = "https://vendor.example/v1"
+wire_api = "responses"
+
+[mcp_servers.cli-owned]
+command = "stale-cli-command"
+
+[mcp_servers.desktop-leak]
+command = "node_repl.exe"
+"#;
+        crate::codex_config::write_codex_live_atomic(
+            &json!({ "OPENAI_API_KEY": "vendor-key" }),
+            Some(initial_cli),
+        )
+        .expect("seed Codex CLI live files");
+
+        let desktop_config = r#"model = "gpt-desktop"
+
+[mcp_servers.node_repl]
+type = "stdio"
+command = "desktop-node-repl.exe"
+"#;
+        std::fs::write(desktop_dir.join("config.toml"), desktop_config)
+            .expect("seed Codex Desktop runtime MCP");
+
+        let provider = Provider::with_id(
+            "vendor".to_string(),
+            "Vendor".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "vendor-key" },
+                "config": r#"model_provider = "vendor"
+model = "gpt-test"
+
+[model_providers.vendor]
+name = "Vendor"
+base_url = "https://vendor.example/v1"
+wire_api = "responses"
+"#
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider)
+            .expect("save Codex provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("set DB current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some(&provider.id))
+            .expect("set local current provider");
+
+        service
+            .set_takeover_for_app("codex", true)
+            .await
+            .expect("enable Codex takeover");
+        let taken_over = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read taken-over CLI config");
+        let taken_over: toml::Value = toml::from_str(&taken_over).expect("parse taken-over config");
+        let taken_over_mcp = taken_over
+            .get("mcp_servers")
+            .and_then(toml::Value::as_table)
+            .expect("CLI MCP projection exists during takeover");
+        // The database owns the CLI entry, while an unrecognized canonical
+        // entry is treated as externally managed and must survive rewrites.
+        assert_eq!(taken_over_mcp.len(), 2);
+        assert_eq!(
+            taken_over_mcp
+                .get("cli-owned")
+                .and_then(|server| server.get("command"))
+                .and_then(toml::Value::as_str),
+            Some("cli-command")
+        );
+        assert_eq!(
+            taken_over_mcp
+                .get("desktop-leak")
+                .and_then(|server| server.get("command"))
+                .and_then(toml::Value::as_str),
+            Some("node_repl.exe")
+        );
+        assert!(taken_over_mcp.get("node_repl").is_none());
+        assert_eq!(
+            std::fs::read_to_string(desktop_dir.join("config.toml"))
+                .expect("read Desktop config after takeover"),
+            desktop_config,
+            "Codex Desktop runtime configuration must remain untouched"
+        );
+
+        service
+            .set_takeover_for_app("codex", false)
+            .await
+            .expect("disable Codex takeover");
+        let restored = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read restored CLI config");
+        let restored: toml::Value = toml::from_str(&restored).expect("parse restored config");
+        let restored_mcp = restored
+            .get("mcp_servers")
+            .and_then(toml::Value::as_table)
+            .expect("CLI MCP projection exists after restore");
+        assert_eq!(restored_mcp.len(), 2);
+        assert!(restored_mcp.get("cli-owned").is_some());
+        assert!(restored_mcp.get("desktop-leak").is_some());
+        assert!(restored_mcp.get("node_repl").is_none());
+        assert_eq!(
+            std::fs::read_to_string(desktop_dir.join("config.toml"))
+                .expect("read Desktop config after restore"),
+            desktop_config
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn shared_codex_mcp_directory_allows_takeover_and_preserves_runtime_mcp() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        crate::settings::update_settings(crate::settings::AppSettings::default())
+            .expect("use the shared historical Codex directory");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        use_ephemeral_proxy_port(&db).await;
+        let service = ProxyService::new(db.clone());
+        let original_config = r#"model_provider = "vendor"
+
+[model_providers.vendor]
+base_url = "https://vendor.example/v1"
+wire_api = "responses"
+
+[mcp_servers.node_repl]
+command = "desktop-node-repl.exe"
+"#;
+        let original_auth = json!({ "OPENAI_API_KEY": "vendor-key" });
+        crate::codex_config::write_codex_live_atomic(&original_auth, Some(original_config))
+            .expect("seed shared Codex config");
+
+        let provider = Provider::with_id(
+            "vendor".to_string(),
+            "Vendor".to_string(),
+            json!({
+                "auth": original_auth,
+                "config": "model_provider = \"vendor\"\n[model_providers.vendor]\nbase_url = \"https://vendor.example/v1\"\nwire_api = \"responses\"\n"
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("set DB current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some(&provider.id))
+            .expect("set local current provider");
+
+        service
+            .set_takeover_for_app("codex", true)
+            .await
+            .expect("shared MCP-bearing directory must allow takeover");
+        assert!(service.is_running().await, "takeover must start the proxy");
+        assert!(
+            db.get_live_backup("codex")
+                .await
+                .expect("read backup")
+                .is_some(),
+            "takeover must create a restore backup"
+        );
+        let backup = db
+            .get_live_backup("codex")
+            .await
+            .expect("read Codex backup")
+            .expect("Codex backup exists");
+        let backup_settings: Value =
+            serde_json::from_str(&backup.original_config).expect("parse Codex backup");
+        assert!(
+            !backup_settings
+                .get("config")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("mcp_servers"),
+            "Desktop runtime MCP must not be persisted in the Codex takeover backup"
+        );
+        assert!(
+            db.get_proxy_config_for_app("codex")
+                .await
+                .expect("read takeover state")
+                .enabled,
+            "takeover must be enabled"
+        );
+        let taken_over = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read taken-over config");
+        assert!(taken_over.contains("[mcp_servers.node_repl]"));
+
+        service
+            .set_takeover_for_app("codex", false)
+            .await
+            .expect("shared MCP-bearing directory must allow restore");
+        let restored = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read restored config");
+        assert!(restored.contains("[mcp_servers.node_repl]"));
+        assert!(restored.contains("https://vendor.example/v1"));
+        assert_eq!(
+            crate::config::read_json_file::<Value>(&crate::codex_config::get_codex_auth_path())
+                .expect("read restored auth"),
+            original_auth
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn shared_codex_mcp_directory_allows_disable_and_preserves_runtime_mcp() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        crate::settings::update_settings(crate::settings::AppSettings::default())
+            .expect("use the shared historical Codex directory");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let taken_over_config = r#"model_provider = "vendor"
+experimental_bearer_token = "PROXY_MANAGED"
+
+[model_providers.vendor]
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "responses"
+
+[mcp_servers.node_repl]
+command = "desktop-node-repl.exe"
+"#;
+        crate::codex_config::write_codex_live_atomic(&json!({}), Some(taken_over_config))
+            .expect("seed taken-over shared config");
+        let backup_json = serde_json::to_string(&json!({
+            "auth": { "OPENAI_API_KEY": "vendor-key" },
+            "config": "model_provider = \"vendor\"\n"
+        }))
+        .expect("serialize backup");
+        db.save_live_backup("codex", &backup_json)
+            .await
+            .expect("seed backup");
+        let mut proxy_config = db
+            .get_proxy_config_for_app("codex")
+            .await
+            .expect("read proxy config");
+        proxy_config.enabled = true;
+        db.update_proxy_config_for_app(proxy_config)
+            .await
+            .expect("seed enabled state");
+
+        service
+            .set_takeover_for_app("codex", false)
+            .await
+            .expect("shared MCP-bearing directory must allow restore");
+        assert!(
+            !db.get_proxy_config_for_app("codex")
+                .await
+                .expect("read takeover state")
+                .enabled,
+            "restore must disable takeover"
+        );
+        assert!(
+            db.get_live_backup("codex")
+                .await
+                .expect("read backup")
+                .is_none(),
+            "successful restore must clear the backup"
+        );
+        let restored = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read restored config");
+        assert!(restored.contains("model_provider = \"vendor\""));
+        assert!(restored.contains("[mcp_servers.node_repl]"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn shared_codex_mcp_directory_allows_hot_switch_and_preserves_runtime_mcp() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        crate::settings::update_settings(crate::settings::AppSettings::default())
+            .expect("use the shared historical Codex directory");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        let provider_a = Provider::with_id(
+            "a".to_string(),
+            "Provider A".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "key-a" },
+                "config": "model_provider = \"a\"\n[model_providers.a]\nbase_url = \"https://a.example/v1\"\nwire_api = \"responses\"\n"
+            }),
+            None,
+        );
+        let provider_b = Provider::with_id(
+            "b".to_string(),
+            "Provider B".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "key-b" },
+                "config": "model_provider = \"b\"\n[model_providers.b]\nbase_url = \"https://b.example/v1\"\nwire_api = \"responses\"\n"
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider_a)
+            .expect("save provider A");
+        db.save_provider("codex", &provider_b)
+            .expect("save provider B");
+        db.set_current_provider("codex", "a")
+            .expect("set DB current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some("a"))
+            .expect("set local current provider");
+
+        let original_live = r#"model_provider = "a"
+experimental_bearer_token = "PROXY_MANAGED"
+
+[model_providers.a]
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "responses"
+
+[mcp_servers.node_repl]
+command = "desktop-node-repl.exe"
+"#;
+        crate::codex_config::write_codex_live_atomic(&json!({}), Some(original_live))
+            .expect("seed shared taken-over config");
+        let original_backup =
+            serde_json::to_string(&provider_a.settings_config).expect("serialize original backup");
+        db.save_live_backup("codex", &original_backup)
+            .await
+            .expect("seed original backup");
+
+        service
+            .hot_switch_provider("codex", "b")
+            .await
+            .expect("shared MCP-bearing directory must allow hot switch");
+        assert_eq!(
+            crate::settings::get_effective_current_provider(&db, &AppType::Codex)
+                .expect("read current provider")
+                .as_deref(),
+            Some("b")
+        );
+        assert!(
+            db.get_live_backup("codex")
+                .await
+                .expect("read backup")
+                .is_some(),
+            "hot switch keeps a restore backup"
+        );
+        let switched = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read switched live config");
+        assert!(switched.contains("model_provider = \"b\""));
+        assert!(switched.contains("[mcp_servers.node_repl]"));
+    }
+
+    #[test]
+    #[serial]
+    fn codex_mcp_projection_allows_shared_directory_and_preserves_live_files() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        crate::settings::update_settings(crate::settings::AppSettings::default())
+            .expect("use the shared historical Codex directory");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+        save_codex_mcp_server(db.as_ref(), "cli-owned", "cli-command");
+
+        let original_auth = json!({ "OPENAI_API_KEY": "original-key" });
+        let original_config = r#"model = "before"
+
+[mcp_servers.desktop-leak]
+command = "desktop-runtime-command"
+
+[mcp_servers.node_repl]
+type = "stdio"
+command = "C:\\Users\\kevin\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\bin\\node_repl.exe"
+
+[mcp_servers.node_repl.env]
+BROWSER_USE_CODEX_APP_BUILD_FLAVOR = "prod"
+NODE_REPL_NODE_PATH = "C:\\Users\\kevin\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\bin\\node.exe"
+SKY_CUA_NATIVE_PIPE = "1"
+"#;
+        crate::codex_config::write_codex_live_atomic(&original_auth, Some(original_config))
+            .expect("seed shared Codex live files");
+
+        let result = service.rewrite_codex_live_with_mcp(
+            &json!({
+                "auth": { "OPENAI_API_KEY": "replacement-key" },
+                "config": "model = \"after\"\n"
+            }),
+            |sanitized| service.write_codex_live_verbatim_with_auth_guard_raw(sanitized, None),
+        );
+
+        result.expect("shared Codex CLI/Desktop directory must allow MCP projection");
+
+        let rewritten = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read projected config");
+        let rewritten: toml::Value = toml::from_str(&rewritten).expect("parse projected config");
+        assert_eq!(
+            rewritten.get("model").and_then(toml::Value::as_str),
+            Some("after")
+        );
+        let projected_mcp = rewritten
+            .get("mcp_servers")
+            .and_then(toml::Value::as_table)
+            .expect("projected CLI MCP exists");
+        assert!(projected_mcp.get("cli-owned").is_some());
+        assert!(projected_mcp.get("desktop-leak").is_some());
+        assert_eq!(
+            projected_mcp
+                .get("node_repl")
+                .and_then(|server| server.get("command"))
+                .and_then(toml::Value::as_str),
+            Some(
+                "C:\\Users\\kevin\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\bin\\node_repl.exe"
+            ),
+            "shared Desktop runtime MCP must survive the CLI projection"
+        );
+        assert_eq!(
+            crate::config::read_json_file::<Value>(&crate::codex_config::get_codex_auth_path())
+                .expect("read projected auth"),
+            json!({ "OPENAI_API_KEY": "replacement-key" })
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn update_live_backup_from_provider_does_not_freeze_codex_mcp_servers() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
 
@@ -7964,8 +8697,8 @@ base_url = "https://new.example/v1"
             .expect("config string");
 
         assert!(
-            config.contains("[mcp_servers.echo]"),
-            "existing Codex MCP section should survive proxy hot-switch backup update"
+            !config.contains("mcp_servers"),
+            "Codex MCP belongs to the DB projection and must not be frozen into the backup"
         );
         assert!(
             config.contains("https://new.example/v1"),
@@ -8273,7 +9006,7 @@ requires_openai_auth = true
 
     #[tokio::test]
     #[serial]
-    async fn update_live_backup_from_provider_keeps_new_codex_mcp_entries_on_conflict() {
+    async fn update_live_backup_from_provider_strips_all_codex_mcp_sources() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
 
@@ -8331,34 +9064,9 @@ command = "latest-command"
             .get("config")
             .and_then(|v| v.as_str())
             .expect("config string");
-        let parsed: toml::Value = toml::from_str(config).expect("parse merged codex config");
-
-        let mcp_servers = parsed
-            .get("mcp_servers")
-            .expect("mcp_servers should be present");
-        assert_eq!(
-            mcp_servers
-                .get("shared")
-                .and_then(|v| v.get("command"))
-                .and_then(|v| v.as_str()),
-            Some("new-command"),
-            "new provider/common-config MCP definition should win on conflict"
-        );
-        assert_eq!(
-            mcp_servers
-                .get("legacy")
-                .and_then(|v| v.get("command"))
-                .and_then(|v| v.as_str()),
-            Some("legacy-command"),
-            "backup-only MCP entries should still be preserved"
-        );
-        assert_eq!(
-            mcp_servers
-                .get("latest")
-                .and_then(|v| v.get("command"))
-                .and_then(|v| v.as_str()),
-            Some("latest-command"),
-            "new MCP entries should remain in the restore backup"
+        assert!(
+            !config.contains("mcp_servers"),
+            "neither stale backup MCP nor provider/common-config MCP may enter a Codex backup"
         );
     }
 
@@ -8375,7 +9083,9 @@ command = "latest-command"
         db.set_config_snippet(
             "codex",
             Some(
-                r#"[mcp_servers.shared]
+                r#"model_reasoning_effort = "high"
+
+[mcp_servers.shared]
 command = "shared-command"
 "#
                 .to_string(),
@@ -8504,12 +9214,12 @@ requires_openai_auth = true
             "config.toml must reference model_catalog_json after switch"
         );
         assert!(
-            config_text.contains("[mcp_servers.shared]"),
-            "config.toml must keep common config after switch"
+            config_text.contains(r#"model_reasoning_effort = "high""#),
+            "non-MCP common config must still survive the switch"
         );
         assert!(
-            config_text.contains(r#"command = "shared-command""#),
-            "config.toml must include common config content after switch"
+            !config_text.contains("mcp_servers"),
+            "common-config MCP must not bypass the Codex CLI DB projection"
         );
     }
 
@@ -9718,6 +10428,7 @@ base_url = "https://third.example/v1"
     async fn restore_prefers_live_codex_oauth_tokens_over_backup_snapshot() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
+        configure_distinct_codex_test_targets();
 
         let db = Arc::new(Database::memory().expect("init db"));
         let service = ProxyService::new(db.clone());
@@ -9752,6 +10463,14 @@ base_url = "https://third.example/v1"
         )
         .expect("corrupt live config after writing valid auth");
 
+        // Ordinary provider/MCP rewrites remain fail-closed for malformed
+        // TOML; only the restore path below is allowed to replace it from the
+        // known-good takeover backup.
+        let strict_error = service
+            .preflight_codex_proxy_live_rewrite()
+            .expect_err("ordinary Codex rewrites must reject malformed TOML");
+        assert!(strict_error.contains("MCP 写入预检失败"));
+
         service
             .restore_live_config_for_app_with_fallback(&AppType::Codex)
             .await
@@ -9765,6 +10484,15 @@ base_url = "https://third.example/v1"
                 .and_then(|v| v.as_str()),
             Some("live-rt"),
             "restore must not roll live tokens back to the takeover-start snapshot"
+        );
+        assert_eq!(
+            live.get("config")
+                .and_then(|config| config.as_str())
+                .and_then(|config| config
+                    .lines()
+                    .find(|line| line.starts_with("model_provider"))),
+            Some("model_provider = \"any\""),
+            "restore must replace malformed config.toml with the backup config"
         );
     }
 

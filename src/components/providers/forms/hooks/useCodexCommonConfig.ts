@@ -38,6 +38,8 @@ interface UseCodexCommonConfigProps {
   };
   initialEnabled?: boolean;
   selectedPresetId?: string;
+  /** Common configuration is only supported for the Codex CLI provider. */
+  enabled?: boolean;
 }
 
 /**
@@ -50,6 +52,7 @@ export function useCodexCommonConfig({
   initialData,
   initialEnabled,
   selectedPresetId,
+  enabled = true,
 }: UseCodexCommonConfigProps) {
   const { t } = useTranslation();
   const [useCommonConfig, setUseCommonConfig] = useState(false);
@@ -66,6 +69,9 @@ export function useCodexCommonConfig({
   const hasInitializedNewMode = useRef(false);
   // 用于跟踪编辑模式是否已初始化显式开关/预览
   const hasInitializedEditMode = useRef(false);
+  // 初始化逻辑只能在当前 enabled 周期的片段加载完成后运行。否则从
+  // Desktop 切回 CLI 的首帧会使用上一个周期的状态提前初始化。
+  const commonConfigReadyRef = useRef(false);
   // 后端 TOML 合并是异步的：连续操作（快速点开关、连点保存）可能乱序
   // 返回。每个写 config 的异步操作在发起时领取递增序号，结果落地前
   // 校验自己仍是最新一次；过期结果直接丢弃，保证最后一次操作胜出。
@@ -86,6 +92,22 @@ export function useCodexCommonConfig({
       baseConfig !== latestCodexConfigRef.current,
     [],
   );
+
+  // CLI/Desktop 共用表单组件。目标变化时让此前所有异步 TOML 操作失效，
+  // 并为下一次 CLI 启用周期重新执行加载和初始化。
+  useEffect(() => {
+    tomlOpSeqRef.current += 1;
+    commonConfigReadyRef.current = false;
+    hasInitializedNewMode.current = false;
+    hasInitializedEditMode.current = false;
+    isUpdatingFromCommonConfig.current = false;
+    setUseCommonConfig(false);
+    // Do not let a previously loaded CLI snippet survive a target change.
+    // If the next CLI load is empty, keeping it would reapply stale settings.
+    setCommonConfigSnippetState(DEFAULT_CODEX_COMMON_CONFIG_SNIPPET);
+    setCommonConfigError("");
+    setIsExtracting(false);
+  }, [enabled]);
 
   // 当预设变化时，重置初始化标记，使新预设能够重新触发初始化逻辑
   useEffect(() => {
@@ -120,6 +142,15 @@ export function useCodexCommonConfig({
   // 初始化：从 config.json 加载，支持从 localStorage 迁移
   useEffect(() => {
     let mounted = true;
+
+    if (!enabled) {
+      setIsLoading(false);
+      return () => {
+        mounted = false;
+      };
+    }
+
+    setIsLoading(true);
 
     const loadSnippet = async () => {
       try {
@@ -157,6 +188,7 @@ export function useCodexCommonConfig({
         console.error("加载 Codex 通用配置失败:", error);
       } finally {
         if (mounted) {
+          commonConfigReadyRef.current = true;
           setIsLoading(false);
         }
       }
@@ -167,11 +199,13 @@ export function useCodexCommonConfig({
     return () => {
       mounted = false;
     };
-  }, []);
+  }, [enabled]);
 
   // 初始化时检查通用配置片段（编辑模式）
   useEffect(() => {
     if (
+      !enabled ||
+      !commonConfigReadyRef.current ||
       !initialData?.settingsConfig ||
       isLoading ||
       hasInitializedEditMode.current
@@ -247,11 +281,18 @@ export function useCodexCommonConfig({
     isTomlOpStale,
     onConfigChange,
     parseCommonConfigSnippet,
+    enabled,
   ]);
 
   // 新建模式：如果通用配置片段存在且有效，默认启用
   useEffect(() => {
-    if (initialData || isLoading || hasInitializedNewMode.current) {
+    if (
+      !enabled ||
+      !commonConfigReadyRef.current ||
+      initialData ||
+      isLoading ||
+      hasInitializedNewMode.current
+    ) {
       return;
     }
 
@@ -305,11 +346,15 @@ export function useCodexCommonConfig({
     codexConfig,
     onConfigChange,
     parseCommonConfigSnippet,
+    enabled,
   ]);
 
   // 处理通用配置开关
   const handleCommonConfigToggle = useCallback(
     async (checked: boolean) => {
+      if (!enabled) {
+        return;
+      }
       // 在同步校验之前领号：即使本次走同步早退分支，也要让更早发出、
       // 仍在飞的异步结果作废，避免它晚到后把开关翻回去。
       const seq = ++tomlOpSeqRef.current;
@@ -361,12 +406,16 @@ export function useCodexCommonConfig({
       onConfigChange,
       parseCommonConfigSnippet,
       t,
+      enabled,
     ],
   );
 
   // 处理通用配置片段变化
   const handleCommonConfigSnippetChange = useCallback(
     async (value: string): Promise<boolean> => {
+      if (!enabled) {
+        return false;
+      }
       // 与 handleCommonConfigToggle 同一套序号：连续保存或保存与开关
       // 交错时，只允许最后一次操作的结果落地。
       const seq = ++tomlOpSeqRef.current;
@@ -403,6 +452,9 @@ export function useCodexCommonConfig({
         configApi
           .setCommonConfigSnippet("codex", "")
           .catch((error: unknown) => {
+            if (isTomlOpStale(seq, codexConfig)) {
+              return;
+            }
             console.error("保存 Codex 通用配置失败:", error);
             setCommonConfigError(
               t("codexConfig.saveFailed", { error: String(error) }),
@@ -463,6 +515,9 @@ export function useCodexCommonConfig({
       configApi
         .setCommonConfigSnippet("codex", value)
         .catch((error: unknown) => {
+          if (isTomlOpStale(seq, codexConfig)) {
+            return;
+          }
           console.error("保存 Codex 通用配置失败:", error);
           setCommonConfigError(
             t("codexConfig.saveFailed", { error: String(error) }),
@@ -479,12 +534,13 @@ export function useCodexCommonConfig({
       parseCommonConfigSnippet,
       t,
       useCommonConfig,
+      enabled,
     ],
   );
 
   // 当配置变化时检查是否包含通用配置（但避免在通过通用配置更新时检查）
   useEffect(() => {
-    if (isUpdatingFromCommonConfig.current || isLoading) {
+    if (!enabled || isUpdatingFromCommonConfig.current || isLoading) {
       return;
     }
     const parsedSnippet = parseCommonConfigSnippet(commonConfigSnippet);
@@ -497,10 +553,20 @@ export function useCodexCommonConfig({
       commonConfigSnippet,
     );
     setUseCommonConfig(hasCommon);
-  }, [codexConfig, commonConfigSnippet, isLoading, parseCommonConfigSnippet]);
+  }, [
+    codexConfig,
+    commonConfigSnippet,
+    enabled,
+    isLoading,
+    parseCommonConfigSnippet,
+  ]);
 
   // 从编辑器当前内容提取通用配置片段
   const handleExtract = useCallback(async () => {
+    if (!enabled) {
+      return;
+    }
+    const seq = ++tomlOpSeqRef.current;
     setIsExtracting(true);
     setCommonConfigError("");
 
@@ -510,6 +576,10 @@ export function useCodexCommonConfig({
           config: codexConfig ?? "",
         }),
       });
+
+      if (isTomlOpStale(seq, codexConfig)) {
+        return;
+      }
 
       if (!extracted || !extracted.trim()) {
         setCommonConfigError(t("codexConfig.extractNoCommonConfig"));
@@ -522,6 +592,9 @@ export function useCodexCommonConfig({
       // 保存到后端
       await configApi.setCommonConfigSnippet("codex", extracted);
     } catch (error) {
+      if (isTomlOpStale(seq, codexConfig)) {
+        return;
+      }
       console.error("提取 Codex 通用配置失败:", error);
       setCommonConfigError(
         t("codexConfig.extractFailed", { error: String(error) }),
@@ -529,18 +602,18 @@ export function useCodexCommonConfig({
     } finally {
       setIsExtracting(false);
     }
-  }, [codexConfig, t]);
+  }, [codexConfig, enabled, isTomlOpStale, t]);
 
   const clearCommonConfigError = useCallback(() => {
     setCommonConfigError("");
   }, []);
 
   return {
-    useCommonConfig,
-    commonConfigSnippet,
-    commonConfigError,
+    useCommonConfig: enabled && useCommonConfig,
+    commonConfigSnippet: enabled ? commonConfigSnippet : "",
+    commonConfigError: enabled ? commonConfigError : "",
     isLoading,
-    isExtracting,
+    isExtracting: enabled && isExtracting,
     handleCommonConfigToggle,
     handleCommonConfigSnippetChange,
     handleExtract,

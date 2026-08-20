@@ -453,13 +453,17 @@ pub fn codex_config_dirs_conflict() -> bool {
     )
 }
 
+fn codex_directory_conflict_error() -> AppError {
+    AppError::localized(
+        "codex_desktop.directory_conflict",
+        "Codex CLI 与 Codex Desktop 当前使用同一配置目录。请为 CLI 配置独立 CODEX_HOME，并在 CC Switch 中填写对应的 CLI 配置目录后再操作。",
+        "Codex CLI and Codex Desktop currently use the same configuration directory. Configure a separate CODEX_HOME for the CLI and set the matching CLI directory in CC Switch before changing Desktop live configuration.",
+    )
+}
+
 pub fn ensure_codex_target_isolated(target: CodexTarget) -> Result<(), AppError> {
     if target == CodexTarget::Desktop && codex_config_dirs_conflict() {
-        return Err(AppError::localized(
-            "codex_desktop.directory_conflict",
-            "Codex CLI 与 Codex Desktop 当前使用同一配置目录。请为 CLI 配置独立 CODEX_HOME，并在 CC Switch 中填写对应的 CLI 配置目录后再操作 Desktop。",
-            "Codex CLI and Codex Desktop currently use the same configuration directory. Configure a separate CODEX_HOME for the CLI and set the matching CLI directory in CC Switch before changing Desktop live configuration.",
-        ));
+        return Err(codex_directory_conflict_error());
     }
     Ok(())
 }
@@ -2635,6 +2639,48 @@ pub fn write_codex_provider_live_with_catalog_for(
     config_text: Option<&str>,
     profile: CodexCatalogToolProfile,
 ) -> Result<(), AppError> {
+    write_codex_provider_live_with_catalog_inner(
+        target,
+        settings,
+        category,
+        auth,
+        config_text,
+        profile,
+        false,
+    )
+}
+
+/// Write a provider whose config became empty only after its MCP tables were
+/// removed. This is deliberately narrower than the normal writer: a truly
+/// missing third-party config must keep the existing validation error.
+pub(crate) fn write_codex_provider_live_with_catalog_after_mcp_strip(
+    target: CodexTarget,
+    settings: &Value,
+    category: Option<&str>,
+    auth: &Value,
+    config_text: Option<&str>,
+    profile: CodexCatalogToolProfile,
+) -> Result<(), AppError> {
+    write_codex_provider_live_with_catalog_inner(
+        target,
+        settings,
+        category,
+        auth,
+        config_text,
+        profile,
+        true,
+    )
+}
+
+fn write_codex_provider_live_with_catalog_inner(
+    target: CodexTarget,
+    settings: &Value,
+    category: Option<&str>,
+    auth: &Value,
+    config_text: Option<&str>,
+    profile: CodexCatalogToolProfile,
+    allow_empty_config_after_mcp_strip: bool,
+) -> Result<(), AppError> {
     ensure_codex_target_isolated(target)?;
     let prepared_config = config_text
         .map(|text| {
@@ -2642,7 +2688,20 @@ pub fn write_codex_provider_live_with_catalog_for(
         })
         .transpose()?;
 
-    write_codex_live_for_provider_for(target, category, auth, prepared_config.as_deref())
+    // A provider snapshot that was sanitized from an MCP-only config keeps an
+    // explicit `config = ""` field.  Treat that as an intentional empty
+    // config, while a missing `config` field still follows the normal
+    // third-party validation path.
+    let allow_empty_config_after_mcp_strip = allow_empty_config_after_mcp_strip
+        || config_text.is_some_and(|text| text.trim().is_empty());
+
+    write_codex_live_for_provider_for_inner(
+        target,
+        category,
+        auth,
+        prepared_config.as_deref(),
+        allow_empty_config_after_mcp_strip,
+    )
 }
 
 /// Extract a provider-scoped `experimental_bearer_token` from Codex `config.toml`.
@@ -3141,16 +3200,16 @@ pub fn strip_codex_unified_session_bucket_from_settings(
 /// `[mcp_servers]` 只是每次写 live 之后由 MCP 同步重新投影的产物。若回填时
 /// 烙进供应商存储配置，已在应用里删除的服务器会随下次激活该供应商被写回
 /// live，而逐条 reconcile 只认识 DB 现存条目、永远清不掉这种孤儿。
-pub fn strip_codex_mcp_servers_from_settings(settings: &mut Value) -> Result<(), AppError> {
+pub fn strip_codex_mcp_servers_from_settings(settings: &mut Value) -> Result<bool, AppError> {
     let Some(config_text) = settings
         .get("config")
         .and_then(|value| value.as_str())
         .map(str::to_string)
     else {
-        return Ok(());
+        return Ok(false);
     };
     if !config_text.contains("mcp") {
-        return Ok(());
+        return Ok(false);
     }
     let mut doc = config_text
         .parse::<DocumentMut>()
@@ -3170,7 +3229,20 @@ pub fn strip_codex_mcp_servers_from_settings(settings: &mut Value) -> Result<(),
             obj.insert("config".to_string(), Value::String(doc.to_string()));
         }
     }
-    Ok(())
+    Ok(changed)
+}
+
+/// Remove MCP projection tables from a CLI common-config snippet before it is
+/// stored.  MCP is managed by the database projection, so a snippet must not
+/// be able to reintroduce Desktop runtime entries on the next provider save.
+pub fn sanitize_codex_common_config_snippet(snippet: &str) -> Result<String, AppError> {
+    let mut settings = json!({"config": snippet});
+    strip_codex_mcp_servers_from_settings(&mut settings)?;
+    Ok(settings
+        .get("config")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string())
 }
 
 /// Route a Codex live write between full auth+config or config-only.
@@ -3195,6 +3267,16 @@ pub fn write_codex_live_for_provider_for(
     auth: &Value,
     config_text: Option<&str>,
 ) -> Result<(), AppError> {
+    write_codex_live_for_provider_for_inner(target, category, auth, config_text, false)
+}
+
+fn write_codex_live_for_provider_for_inner(
+    target: CodexTarget,
+    category: Option<&str>,
+    auth: &Value,
+    config_text: Option<&str>,
+    allow_empty_config_after_mcp_strip: bool,
+) -> Result<(), AppError> {
     ensure_codex_target_isolated(target)?;
     let unified_official_config =
         if category == Some("official") && crate::settings::unify_codex_session_history() {
@@ -3213,7 +3295,13 @@ pub fn write_codex_live_for_provider_for(
     if should_write_auth {
         write_codex_live_atomic_for(target, auth, config_text)
     } else {
-        let live_config = prepare_codex_provider_live_config(auth, config_text.unwrap_or(""))?;
+        let live_config = if allow_empty_config_after_mcp_strip
+            && config_text.is_some_and(|text| text.trim().is_empty())
+        {
+            prepare_codex_provider_live_config_after_mcp_strip(auth, config_text.unwrap_or(""))?
+        } else {
+            prepare_codex_provider_live_config(auth, config_text.unwrap_or(""))?
+        };
         write_codex_live_config_atomic_for(target, Some(&live_config))
     }
 }
@@ -3232,6 +3320,24 @@ pub fn prepare_codex_provider_live_config(
         .or_else(|| extract_codex_experimental_bearer_token(config_text));
 
     Ok(match token {
+        Some(token) => set_codex_experimental_bearer_token(config_text, &token)?,
+        None => config_text.to_string(),
+    })
+}
+
+pub(crate) fn prepare_codex_provider_live_config_after_mcp_strip(
+    auth: &Value,
+    config_text: &str,
+) -> Result<String, AppError> {
+    let token = extract_codex_auth_api_key(auth)
+        .or_else(|| extract_codex_experimental_bearer_token(config_text));
+
+    Ok(match token {
+        Some(token) if config_text.trim().is_empty() => {
+            let mut doc = DocumentMut::new();
+            doc["experimental_bearer_token"] = toml_edit::value(token);
+            doc.to_string()
+        }
         Some(token) => set_codex_experimental_bearer_token(config_text, &token)?,
         None => config_text.to_string(),
     })
@@ -3822,6 +3928,16 @@ requires_openai_auth = true
     }
 
     #[test]
+    fn sanitize_codex_common_config_snippet_removes_mcp_projection() {
+        let snippet =
+            "model_context_window = 1000000\n\n[mcp_servers.node_repl]\ncommand = \"node_repl\"\n";
+        let sanitized = sanitize_codex_common_config_snippet(snippet).expect("sanitize snippet");
+
+        assert!(sanitized.contains("model_context_window = 1000000"));
+        assert!(!sanitized.contains("mcp_servers"));
+    }
+
+    #[test]
     fn extract_base_url_prefers_active_provider_section() {
         let input = r#"model_provider = "azure"
 
@@ -3868,11 +3984,44 @@ base_url = "https://single.example.com/v1"
     #[test]
     fn prepare_provider_live_config_rejects_key_without_config() {
         let err = prepare_codex_provider_live_config(&json!({"OPENAI_API_KEY": "sk-test"}), "")
-            .expect_err("empty config with API key should not truncate live config");
-
+            .expect_err("a genuinely missing config must not truncate live config");
         assert!(
             err.to_string().contains("config.toml"),
             "error should explain missing config.toml, got: {err}"
+        );
+    }
+
+    #[test]
+    fn prepare_provider_live_config_strips_mcp_only_snapshot_before_writing_key() {
+        let mut settings = json!({
+            "auth": { "OPENAI_API_KEY": "sk-test" },
+            "config": "[mcp_servers.latest]\ntype = \"stdio\"\ncommand = \"say\"\n"
+        });
+        assert!(strip_codex_mcp_servers_from_settings(&mut settings).expect("strip MCP projection"));
+        let config = settings
+            .get("config")
+            .and_then(Value::as_str)
+            .expect("config text remains present");
+        assert!(
+            config.trim().is_empty(),
+            "MCP-only provider snapshots should become an empty CLI config"
+        );
+
+        let output = prepare_codex_provider_live_config_after_mcp_strip(
+            settings.get("auth").expect("auth"),
+            config,
+        )
+        .expect("empty post-MCP config should remain writable");
+        let parsed: toml::Value = toml::from_str(&output).expect("parse output");
+        assert_eq!(
+            parsed
+                .get("experimental_bearer_token")
+                .and_then(|value| value.as_str()),
+            Some("sk-test")
+        );
+        assert!(
+            !output.contains("mcp_servers"),
+            "CLI config must not restore the MCP table from the provider snapshot"
         );
     }
 

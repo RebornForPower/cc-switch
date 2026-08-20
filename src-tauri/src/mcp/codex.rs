@@ -5,18 +5,227 @@
 //! - 同步到 ~/.codex/config.toml
 //! - JSON 到 TOML 的转换逻辑
 
+use indexmap::IndexMap;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
 use crate::app_config::{McpApps, McpConfig, McpServer, MultiAppConfig};
+use crate::codex_config::CodexTarget;
 use crate::error::AppError;
 
 use super::validation::{extract_server_spec, validate_server_spec};
 
-fn should_sync_codex_mcp() -> bool {
+pub(crate) fn should_sync_codex_mcp() -> bool {
     // Codex 未安装/未初始化时：~/.codex 目录不存在。
     // 按用户偏好：目录缺失时跳过写入/删除，不创建任何文件或目录。
     crate::codex_config::get_codex_config_dir().exists()
+}
+
+/// MCP entries that are not owned by the Codex CLI database projection.
+///
+/// Codex Desktop can inject runtime entries (notably `node_repl`) into the
+/// same physical `config.toml` used by the CLI. Provider switches replace the
+/// rest of that file, so callers capture these raw TOML items before a rewrite
+/// and merge them back afterwards without importing them into the CLI MCP
+/// registry.
+#[derive(Debug, Clone, Default)]
+pub struct CodexMcpLiveSnapshot {
+    entries: IndexMap<String, toml_edit::Item>,
+}
+
+impl CodexMcpLiveSnapshot {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &toml_edit::Item)> {
+        self.entries.iter().map(|(id, item)| (id.as_str(), item))
+    }
+
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&str, &toml_edit::Item) -> bool) {
+        self.entries.retain(|id, item| keep(id, item));
+    }
+
+    fn contains_key(&self, id: &str) -> bool {
+        self.entries.contains_key(id)
+    }
+}
+
+fn collect_mcp_server_items(doc: &toml_edit::DocumentMut) -> CodexMcpLiveSnapshot {
+    let mut entries = IndexMap::new();
+
+    // Only the canonical Codex table can be preserved across a provider
+    // rewrite. `[mcp.servers]` is a historical CC Switch write bug; capturing
+    // it here would silently convert the stale form back into a live
+    // `[mcp_servers]` entry after every save.
+    if let Some(servers) = doc
+        .get("mcp_servers")
+        .and_then(toml_edit::Item::as_table_like)
+    {
+        for (id, item) in servers.iter() {
+            entries.insert(id.to_string(), item.clone());
+        }
+    }
+
+    CodexMcpLiveSnapshot { entries }
+}
+
+pub fn capture_codex_mcp_live_snapshot_for(
+    target: CodexTarget,
+) -> Result<CodexMcpLiveSnapshot, AppError> {
+    let text = crate::codex_config::read_and_validate_codex_config_text_for(target)?;
+    if text.trim().is_empty() {
+        return Ok(CodexMcpLiveSnapshot::default());
+    }
+    let doc = text.parse::<toml_edit::DocumentMut>().map_err(|error| {
+        AppError::McpValidation(format!("解析 Codex config.toml 失败: {error}"))
+    })?;
+    Ok(collect_mcp_server_items(&doc))
+}
+
+fn remove_legacy_mcp_server_table(doc: &mut toml_edit::DocumentMut) {
+    if let Some(mcp) = doc
+        .get_mut("mcp")
+        .and_then(toml_edit::Item::as_table_like_mut)
+    {
+        mcp.remove("servers");
+    }
+}
+
+/// Replace only the CLI MCP projection while retaining runtime-owned entries
+/// captured before an enclosing provider rewrite.
+pub fn write_codex_mcp_projection_for(
+    target: CodexTarget,
+    preserved: &CodexMcpLiveSnapshot,
+    servers: &IndexMap<String, McpServer>,
+) -> Result<(), AppError> {
+    if target != CodexTarget::Cli {
+        return Err(AppError::InvalidInput(
+            "Codex Desktop MCP is runtime-managed".to_string(),
+        ));
+    }
+
+    let text = crate::codex_config::read_and_validate_codex_config_text_for(target)?;
+    let mut doc = if text.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        text.parse::<toml_edit::DocumentMut>().map_err(|error| {
+            AppError::McpValidation(format!("解析 Codex config.toml 失败: {error}"))
+        })?
+    };
+
+    doc.as_table_mut().remove("mcp_servers");
+    remove_legacy_mcp_server_table(&mut doc);
+
+    let mut projected = toml_edit::Table::new();
+    for (id, item) in preserved.iter() {
+        projected.insert(id, item.clone());
+    }
+    for server in servers.values().filter(|server| server.apps.codex) {
+        // A preserved runtime entry owns its ID in a shared physical file.
+        // Historical builds could also have imported that entry into the CLI
+        // database; the service layer clears that stale flag after this write.
+        if preserved.contains_key(&server.id) {
+            continue;
+        }
+        let table = json_server_to_toml_table(&server.server)?;
+        projected.insert(&server.id, toml_edit::Item::Table(table));
+    }
+
+    if !projected.is_empty() {
+        doc["mcp_servers"] = toml_edit::Item::Table(projected);
+    }
+
+    let path = crate::codex_config::get_codex_config_path_for(target);
+    crate::config::write_text_file(&path, &doc.to_string())
+}
+
+pub fn is_codex_desktop_runtime_mcp_spec(id: &str, spec: &Value) -> bool {
+    if id != "node_repl" {
+        return false;
+    }
+    let Some(command) = spec.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    let command = command.replace('\\', "/").to_ascii_lowercase();
+    if !command.ends_with("/node_repl.exe") && !command.ends_with("/node_repl") {
+        return false;
+    }
+    let Some(env) = spec.get("env").and_then(Value::as_object) else {
+        return false;
+    };
+    [
+        "BROWSER_USE_CODEX_APP_BUILD_FLAVOR",
+        "NODE_REPL_NODE_PATH",
+        "SKY_CUA_NATIVE_PIPE",
+    ]
+    .iter()
+    .all(|key| env.contains_key(*key))
+}
+
+pub fn is_codex_desktop_runtime_mcp_item(id: &str, item: &toml_edit::Item) -> bool {
+    if id != "node_repl" {
+        return false;
+    }
+    let Some(table) = item.as_table_like() else {
+        return false;
+    };
+    let Some(command) = table.get("command").and_then(toml_edit::Item::as_str) else {
+        return false;
+    };
+    let command = command.replace('\\', "/").to_ascii_lowercase();
+    if !command.ends_with("/node_repl.exe") && !command.ends_with("/node_repl") {
+        return false;
+    }
+    let Some(env) = table.get("env").and_then(toml_edit::Item::as_table_like) else {
+        return false;
+    };
+    [
+        "BROWSER_USE_CODEX_APP_BUILD_FLAVOR",
+        "NODE_REPL_NODE_PATH",
+        "SKY_CUA_NATIVE_PIPE",
+    ]
+    .iter()
+    .all(|key| env.contains_key(key))
+}
+
+fn codex_desktop_runtime_mcp_conflict(id: &str) -> AppError {
+    AppError::Conflict(format!(
+        "MCP 服务器 '{id}' 由 Codex Desktop 运行时管理，不能作为 Codex CLI MCP 写入"
+    ))
+}
+
+/// Reject writes that would make a Desktop runtime entry part of the CLI MCP
+/// projection.  The check is intentionally performed before callers persist
+/// `enabled_codex`, so direct MCP toggles cannot leave a conflicting database
+/// state behind when CLI and Desktop share `config.toml`.
+pub(crate) fn ensure_codex_cli_mcp_write_allowed(
+    id: &str,
+    server_spec: &Value,
+) -> Result<(), AppError> {
+    if is_codex_desktop_runtime_mcp_spec(id, server_spec) {
+        return Err(codex_desktop_runtime_mcp_conflict(id));
+    }
+
+    if !should_sync_codex_mcp() || !crate::codex_config::codex_config_dirs_conflict() {
+        return Ok(());
+    }
+
+    let path = crate::codex_config::get_codex_config_path();
+    if !path.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&path).map_err(|error| AppError::io(&path, error))?;
+    let doc = text.parse::<toml_edit::DocumentMut>().map_err(|error| {
+        AppError::McpValidation(format!("解析 Codex config.toml 失败: {error}"))
+    })?;
+
+    if doc
+        .get("mcp_servers")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|servers| servers.get(id))
+        .is_some_and(|item| is_codex_desktop_runtime_mcp_item(id, item))
+    {
+        return Err(codex_desktop_runtime_mcp_conflict(id));
+    }
+
+    Ok(())
 }
 
 /// 返回已启用的 MCP 服务器（过滤 enabled==true）
@@ -50,13 +259,27 @@ fn collect_enabled_servers(cfg: &McpConfig) -> HashMap<String, Value> {
 ///
 /// 已存在的服务器将启用 Codex 应用，不覆盖其他字段和应用状态
 pub fn import_from_codex(config: &mut MultiAppConfig) -> Result<usize, AppError> {
-    let text = crate::codex_config::read_and_validate_codex_config_text()?;
+    import_from_codex_for(config, CodexTarget::Cli)
+}
+
+/// Import MCP entries from a specific Codex target.
+///
+/// CC Switch only owns the CLI MCP projection.  Desktop's runtime-managed
+/// MCP table is intentionally never imported into the shared database.
+pub fn import_from_codex_for(
+    config: &mut MultiAppConfig,
+    target: CodexTarget,
+) -> Result<usize, AppError> {
+    if target != CodexTarget::Cli {
+        return Ok(0);
+    }
+    let text = crate::codex_config::read_and_validate_codex_config_text_for(target)?;
     if text.trim().is_empty() {
         return Ok(0);
     }
 
     let root: toml::Table = toml::from_str(&text)
-        .map_err(|e| AppError::McpValidation(format!("解析 ~/.codex/config.toml 失败: {e}")))?;
+        .map_err(|e| AppError::McpValidation(format!("解析 Codex CLI config.toml 失败: {e}")))?;
 
     // 确保新结构存在
     let servers = config.mcp.servers.get_or_insert_with(HashMap::new);
@@ -212,6 +435,14 @@ pub fn import_from_codex(config: &mut MultiAppConfig) -> Result<usize, AppError>
 
             let spec_v = serde_json::Value::Object(spec);
 
+            // Codex Desktop adds this runtime server to the shared config
+            // itself. It is not a user-configured CLI MCP and must never set
+            // the database's CLI enablement flag.
+            if is_codex_desktop_runtime_mcp_spec(id, &spec_v) {
+                log::debug!("跳过 Codex Desktop runtime MCP '{id}'");
+                continue;
+            }
+
             // 校验：单项失败继续处理
             if let Err(e) = validate_server_spec(&spec_v) {
                 log::warn!("跳过无效 Codex MCP 项 '{id}': {e}");
@@ -314,28 +545,53 @@ pub fn sync_enabled_to_codex(config: &MultiAppConfig) -> Result<(), AppError> {
         }
     }
 
-    // 5) 构造目标 servers 表（稳定的键顺序）
-    if enabled.is_empty() {
-        // 无启用项：移除 mcp_servers 表
-        doc.as_table_mut().remove("mcp_servers");
+    // 5) The legacy API owns the complete CLI projection. Preserve only the
+    // unmistakable Desktop runtime entry when both targets share a file;
+    // provider/transactional paths use `CodexMcpLiveSnapshot` for the richer
+    // external-entry preservation semantics.
+    let preserved_runtime = if crate::codex_config::codex_config_dirs_conflict() {
+        doc.get("mcp_servers")
+            .and_then(Item::as_table_like)
+            .and_then(|servers| servers.get("node_repl"))
+            .filter(|item| is_codex_desktop_runtime_mcp_item("node_repl", item))
+            .cloned()
     } else {
-        // 构建 servers 表
-        let mut servers_tbl = Table::new();
-        let mut ids: Vec<_> = enabled.keys().cloned().collect();
-        ids.sort();
-        for id in ids {
-            let spec = enabled.get(&id).expect("spec must exist");
-            // 复用通用转换函数（已包含扩展字段支持）
-            match json_server_to_toml_table(spec) {
-                Ok(table) => {
-                    servers_tbl[&id[..]] = Item::Table(table);
-                }
-                Err(err) => {
-                    log::error!("跳过无效的 MCP 服务器 '{id}': {err}");
-                }
+        None
+    };
+    let preserves_desktop_node_repl = preserved_runtime.is_some();
+
+    let mut servers_tbl = Table::new();
+    if let Some(item) = preserved_runtime {
+        servers_tbl.insert("node_repl", item);
+    }
+    let mut ids: Vec<_> = enabled.keys().cloned().collect();
+    ids.sort();
+    for id in ids {
+        let spec = enabled.get(&id).expect("spec must exist");
+        // A historical legacy CLI entry can share the runtime's fixed ID.
+        // The shared physical file belongs to Desktop for that ID, so never
+        // let the compatibility projection overwrite the preserved item.
+        if preserves_desktop_node_repl && id == "node_repl" {
+            log::warn!(
+                "跳过同名 legacy Codex CLI MCP 'node_repl'，保留 Codex Desktop runtime 配置"
+            );
+            continue;
+        }
+        if is_codex_desktop_runtime_mcp_spec(&id, spec) {
+            continue;
+        }
+        match json_server_to_toml_table(spec) {
+            Ok(table) => {
+                servers_tbl.insert(&id, Item::Table(table));
+            }
+            Err(err) => {
+                log::error!("跳过无效的 MCP 服务器 '{id}': {err}");
             }
         }
-        // 使用唯一正确的格式：[mcp_servers]
+    }
+    if servers_tbl.is_empty() {
+        doc.as_table_mut().remove("mcp_servers");
+    } else {
         doc["mcp_servers"] = Item::Table(servers_tbl);
     }
 
@@ -424,6 +680,7 @@ pub fn sync_single_server_to_codex(
     if !should_sync_codex_mcp() {
         return Ok(());
     }
+    ensure_codex_cli_mcp_write_allowed(id, server_spec)?;
 
     // 读取现有的 config.toml
     let config_path = crate::codex_config::get_codex_config_path();
@@ -484,6 +741,19 @@ pub fn remove_server_from_codex(id: &str) -> Result<(), AppError> {
             return Ok(());
         }
     };
+
+    // In a shared CLI/Desktop directory the Desktop runtime owns its
+    // distinctive `node_repl` entry. Disabling a stale historical DB row must
+    // clear only the CLI flag, never remove Desktop's live process definition.
+    if crate::codex_config::codex_config_dirs_conflict()
+        && doc
+            .get("mcp_servers")
+            .and_then(toml_edit::Item::as_table_like)
+            .and_then(|servers| servers.get(id))
+            .is_some_and(|item| is_codex_desktop_runtime_mcp_item(id, item))
+    {
+        return Ok(());
+    }
 
     remove_mcp_server_from_doc(&mut doc, id);
 
@@ -730,6 +1000,28 @@ pub(super) fn json_server_to_toml_table(spec: &Value) -> Result<toml_edit::Table
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_live_snapshot_captures_only_canonical_server_table() {
+        let doc = r#"
+            [mcp_servers.desktop-runtime]
+            command = "node_repl"
+
+            [mcp]
+            unrelated = true
+
+            [mcp.servers.legacy]
+            command = "legacy"
+            "#
+        .parse::<toml_edit::DocumentMut>()
+        .expect("fixture parses");
+
+        let snapshot = collect_mcp_server_items(&doc);
+        let ids = snapshot.iter().map(|(id, _)| id).collect::<Vec<_>>();
+        assert!(ids.contains(&"desktop-runtime"));
+        assert!(!ids.contains(&"legacy"));
+        assert_eq!(ids.len(), 1);
+    }
 
     #[test]
     fn upsert_normalizes_non_table_mcp_servers_without_panicking() {

@@ -495,7 +495,7 @@ fn settings_contain_common_config(app_type: &AppType, settings: &Value, snippet:
             Ok(source) if source.is_object() => json_is_subset(settings, &source),
             _ => false,
         },
-        AppType::Codex | AppType::CodexDesktop => {
+        AppType::Codex => {
             let config_toml = settings.get("config").and_then(Value::as_str).unwrap_or("");
             if config_toml.trim().is_empty() {
                 return false;
@@ -530,7 +530,8 @@ fn settings_contain_common_config(app_type: &AppType, settings: &Value, snippet:
         | AppType::OpenClaw
         | AppType::Hermes
         | AppType::Pi
-        | AppType::ClaudeDesktop => false,
+        | AppType::ClaudeDesktop
+        | AppType::CodexDesktop => false,
     }
 }
 
@@ -539,6 +540,10 @@ pub(crate) fn provider_uses_common_config(
     provider: &Provider,
     snippet: Option<&str>,
 ) -> bool {
+    if matches!(app_type, AppType::CodexDesktop) {
+        return false;
+    }
+
     match provider
         .meta
         .as_ref()
@@ -569,7 +574,7 @@ pub(crate) fn remove_common_config_from_settings(
             json_deep_remove(&mut result, &source);
             Ok(result)
         }
-        AppType::Codex | AppType::CodexDesktop => {
+        AppType::Codex => {
             let mut result = settings.clone();
             let config_toml = settings.get("config").and_then(Value::as_str).unwrap_or("");
             let mut target_doc = if config_toml.trim().is_empty() {
@@ -605,7 +610,8 @@ pub(crate) fn remove_common_config_from_settings(
         | AppType::OpenClaw
         | AppType::Hermes
         | AppType::Pi
-        | AppType::ClaudeDesktop => Ok(settings.clone()),
+        | AppType::ClaudeDesktop
+        | AppType::CodexDesktop => Ok(settings.clone()),
     }
 }
 
@@ -627,7 +633,7 @@ fn apply_common_config_to_settings(
             json_deep_merge(&mut result, &source);
             Ok(result)
         }
-        AppType::Codex | AppType::CodexDesktop => {
+        AppType::Codex => {
             let mut result = settings.clone();
             let config_toml = settings.get("config").and_then(Value::as_str).unwrap_or("");
             let mut target_doc = if config_toml.trim().is_empty() {
@@ -665,7 +671,8 @@ fn apply_common_config_to_settings(
         | AppType::OpenClaw
         | AppType::Hermes
         | AppType::Pi
-        | AppType::ClaudeDesktop => Ok(settings.clone()),
+        | AppType::ClaudeDesktop
+        | AppType::CodexDesktop => Ok(settings.clone()),
     }
 }
 
@@ -674,6 +681,10 @@ pub(crate) fn build_effective_settings_with_common_config(
     app_type: &AppType,
     provider: &Provider,
 ) -> Result<Value, AppError> {
+    if matches!(app_type, AppType::CodexDesktop) {
+        return Ok(provider.settings_config.clone());
+    }
+
     let snippet = db.get_config_snippet(app_type.as_str())?;
     let mut effective_settings = provider.settings_config.clone();
 
@@ -719,6 +730,17 @@ pub(crate) fn write_live_with_common_config_for_codex_oauth_manager(
     provider: &Provider,
     codex_oauth_manager: &Arc<CodexOAuthManager>,
 ) -> Result<(), AppError> {
+    let codex_live_snapshot = if matches!(app_type, AppType::Codex) {
+        Some(crate::codex_config::CodexLiveStateSnapshot::capture()?)
+    } else {
+        None
+    };
+    let codex_mcp_preflight = if matches!(app_type, AppType::Codex) {
+        Some(McpService::preflight_codex_live_rewrite_with_db(db)?)
+    } else {
+        None
+    };
+
     let effective_provider = build_effective_provider_for_live_with_codex_oauth_manager(
         db,
         app_type,
@@ -745,7 +767,27 @@ pub(crate) fn write_live_with_common_config_for_codex_oauth_manager(
         return Ok(());
     }
 
-    write_live_snapshot(app_type, &effective_provider)
+    let write_result = (|| {
+        write_live_snapshot(app_type, &effective_provider)?;
+        if let Some(preflight) = codex_mcp_preflight {
+            McpService::sync_codex_after_live_rewrite_with_db(db, preflight)?;
+        }
+        Ok::<(), AppError>(())
+    })();
+
+    if let Err(error) = write_result {
+        if let Some(snapshot) = codex_live_snapshot.as_ref() {
+            return match snapshot.restore_preserving_newer_same_account_auth() {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(AppError::Message(format!(
+                    "写入 Codex Live 配置失败: {error}; 回滚失败: {rollback_error}"
+                ))),
+            };
+        }
+        return Err(error);
+    }
+
+    Ok(())
 }
 
 pub(crate) fn build_effective_provider_for_live_with_codex_oauth_manager(
@@ -1163,6 +1205,19 @@ pub(crate) fn normalize_provider_common_config_for_storage(
     app_type: &AppType,
     provider: &mut Provider,
 ) -> Result<(), AppError> {
+    if matches!(app_type, AppType::CodexDesktop) {
+        return Ok(());
+    }
+
+    // Codex CLI MCP is projected from the database and must never become part
+    // of a provider snapshot.  In particular, a live Desktop runtime can be
+    // present in the same historical config payload while the user edits a
+    // CLI provider.  Keep the stored provider independent of that runtime
+    // table; Desktop providers deliberately take the branch above unchanged.
+    if matches!(app_type, AppType::Codex) {
+        crate::codex_config::strip_codex_mcp_servers_from_settings(&mut provider.settings_config)?;
+    }
+
     let uses_common_config = provider
         .meta
         .as_ref()
@@ -1292,8 +1347,20 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
         AppType::Codex => {
             let target = crate::codex_config::CodexTarget::from_app(app_type)
                 .expect("Codex app type must map to a live target");
-            let obj = provider
-                .settings_config
+            let mut settings = provider.settings_config.clone();
+            let had_config_before_mcp_strip = settings
+                .get("config")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty());
+            let mcp_was_stripped =
+                crate::codex_config::strip_codex_mcp_servers_from_settings(&mut settings)?;
+            let config_is_empty_after_mcp_strip = settings
+                .get("config")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.trim().is_empty());
+            let config_was_mcp_only =
+                had_config_before_mcp_strip && mcp_was_stripped && config_is_empty_after_mcp_strip;
+            let obj = settings
                 .as_object()
                 .ok_or_else(|| AppError::Config("Codex 供应商配置必须是 JSON 对象".to_string()))?;
             let auth = obj
@@ -1307,14 +1374,25 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
             // the proxy router (apiFormat meta/settings + TOML wire_api).
             let profile = crate::proxy::providers::resolve_codex_catalog_tool_profile(provider);
 
-            crate::codex_config::write_codex_provider_live_with_catalog_for(
-                target,
-                &provider.settings_config,
-                provider.category.as_deref(),
-                auth,
-                config_str,
-                profile,
-            )?;
+            if config_was_mcp_only {
+                crate::codex_config::write_codex_provider_live_with_catalog_after_mcp_strip(
+                    target,
+                    &settings,
+                    provider.category.as_deref(),
+                    auth,
+                    config_str,
+                    profile,
+                )?;
+            } else {
+                crate::codex_config::write_codex_provider_live_with_catalog_for(
+                    target,
+                    &settings,
+                    provider.category.as_deref(),
+                    auth,
+                    config_str,
+                    profile,
+                )?;
+            }
             if provider
                 .meta
                 .as_ref()
@@ -1615,6 +1693,12 @@ pub fn read_live_settings(app_type: AppType) -> Result<Value, AppError> {
             let target = crate::codex_config::CodexTarget::from_app(&app_type)
                 .expect("Codex app type must map to a live target");
             let mut result = crate::codex_config::read_codex_live_settings_for(target)?;
+            if matches!(target, crate::codex_config::CodexTarget::Cli) {
+                // The CLI editor may inspect live settings, but MCP ownership
+                // remains in the database.  Do not feed the live projection
+                // back into the provider draft on the next save.
+                crate::codex_config::strip_codex_mcp_servers_from_settings(&mut result)?;
+            }
             // `modelCatalog` is a cc-switch private field that lives only in
             // the DB SSOT plus the `cc-switch-model-catalog.json` projection
             // file — it is never inlined into `auth.json` or `config.toml`.
@@ -1768,7 +1852,13 @@ pub fn import_default_config(state: &AppState, app_type: AppType) -> Result<bool
         AppType::Codex | AppType::CodexDesktop => {
             let target = crate::codex_config::CodexTarget::from_app(&app_type)
                 .expect("Codex app type must map to a live target");
-            crate::codex_config::read_codex_live_settings_for(target)?
+            let mut settings = crate::codex_config::read_codex_live_settings_for(target)?;
+            if matches!(target, crate::codex_config::CodexTarget::Cli) {
+                // MCP is imported/projected separately from the provider
+                // snapshot.  Keep Desktop runtime entries out of the CLI row.
+                crate::codex_config::strip_codex_mcp_servers_from_settings(&mut settings)?;
+            }
+            settings
         }
         AppType::GrokBuild => {
             let mut settings = crate::grok_config::read_grok_live_settings()?;
@@ -2715,6 +2805,41 @@ base_url = "https://a.example/v1"
         let stripped =
             remove_common_config_from_settings(&AppType::Codex, &applied, snippet).unwrap();
         assert_eq!(stripped, settings);
+    }
+
+    #[test]
+    fn codex_desktop_common_config_is_runtime_managed_and_untouched() {
+        let settings = json!({
+            "auth": {
+                "OPENAI_API_KEY": "sk-test"
+            },
+            "config": "model_provider = \"openai\"\n"
+        });
+        let snippet = "[shared]\nreasoning = \"medium\"\n";
+        let mut provider = Provider::with_id(
+            "desktop-provider".to_string(),
+            "Desktop Provider".to_string(),
+            settings.clone(),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            common_config_enabled: Some(true),
+            ..Default::default()
+        });
+
+        assert!(!provider_uses_common_config(
+            &AppType::CodexDesktop,
+            &provider,
+            Some(snippet)
+        ));
+        assert_eq!(
+            apply_common_config_to_settings(&AppType::CodexDesktop, &settings, snippet).unwrap(),
+            settings
+        );
+        assert_eq!(
+            remove_common_config_from_settings(&AppType::CodexDesktop, &settings, snippet).unwrap(),
+            settings
+        );
     }
 
     #[test]

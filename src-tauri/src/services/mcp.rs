@@ -2,12 +2,24 @@ use indexmap::IndexMap;
 use std::collections::HashMap;
 
 use crate::app_config::{AppType, McpServer};
+use crate::database::Database;
 use crate::error::AppError;
 use crate::mcp;
 use crate::store::AppState;
 
 /// MCP 相关业务逻辑（v3.7.0 统一结构）
 pub struct McpService;
+
+/// Opaque snapshot captured before a Codex CLI provider rewrites live config.
+///
+/// Consuming this token after the rewrite guarantees MCP ownership is based on
+/// the pre-write CLI/Desktop files rather than the newly replaced CLI file.
+#[derive(Debug)]
+pub struct CodexMcpLiveRewritePreflight {
+    servers: IndexMap<String, McpServer>,
+    preserved_live: crate::mcp::CodexMcpLiveSnapshot,
+    legacy_cli_flags_to_clear: Vec<String>,
+}
 
 impl McpService {
     /// 获取所有 MCP 服务器（统一结构）
@@ -17,6 +29,10 @@ impl McpService {
 
     /// 添加或更新 MCP 服务器
     pub fn upsert_server(state: &AppState, server: McpServer) -> Result<(), AppError> {
+        if server.apps.codex {
+            crate::mcp::ensure_codex_cli_mcp_write_allowed(&server.id, &server.server)?;
+        }
+
         // 读取旧状态：用于处理“编辑时取消勾选某个应用”的场景（需要从对应 live 配置中移除）
         let prev_apps = state
             .db
@@ -75,6 +91,13 @@ impl McpService {
         app: AppType,
         enabled: bool,
     ) -> Result<(), AppError> {
+        if enabled && app == AppType::Codex {
+            let server = state.db.get_all_mcp_servers()?.get(server_id).cloned();
+            if let Some(server) = server {
+                crate::mcp::ensure_codex_cli_mcp_write_allowed(&server.id, &server.server)?;
+            }
+        }
+
         if let Some(server) = state
             .db
             .update_mcp_server_app_enabled(server_id, &app, enabled)?
@@ -121,7 +144,9 @@ impl McpService {
                 mcp::sync_single_server_to_codex(&Default::default(), &server.id, &server.server)?;
             }
             AppType::CodexDesktop => {
-                log::debug!("Codex Desktop shares the Codex CLI MCP projection, skipping");
+                // Codex Desktop's runtime owns its MCP configuration; it is
+                // deliberately outside CC Switch's CLI projection.
+                log::debug!("Codex Desktop MCP is runtime-managed, skipping sync");
             }
             AppType::Gemini => {
                 mcp::sync_single_server_to_gemini(&Default::default(), &server.id, &server.server)?;
@@ -167,6 +192,10 @@ impl McpService {
     }
 
     fn remove_server_from_app(_state: &AppState, id: &str, app: &AppType) -> Result<(), AppError> {
+        Self::remove_server_from_app_no_config(id, app)
+    }
+
+    fn remove_server_from_app_no_config(id: &str, app: &AppType) -> Result<(), AppError> {
         match app {
             AppType::Claude => mcp::remove_server_from_claude(id)?,
             AppType::ClaudeDesktop => {
@@ -174,7 +203,8 @@ impl McpService {
             }
             AppType::Codex => mcp::remove_server_from_codex(id)?,
             AppType::CodexDesktop => {
-                log::debug!("Codex Desktop shares the Codex CLI MCP projection, skipping");
+                // Codex Desktop's runtime owns its MCP configuration.
+                log::debug!("Codex Desktop MCP is runtime-managed, skipping remove");
             }
             AppType::Gemini => mcp::remove_server_from_gemini(id)?,
             AppType::GrokBuild => mcp::remove_server_from_grokbuild(id)?,
@@ -204,7 +234,21 @@ impl McpService {
 
         let mut failures: Vec<String> = Vec::new();
         for app in AppType::all() {
-            if let Err(err) = Self::project_servers_to_app(state, &servers, &app) {
+            // Codex needs a live-file ownership check before projection. Keep
+            // it inside Codex's own iteration so a conflict cannot prevent
+            // Claude/Gemini/etc. from completing their independent sync.
+            let result = if app == AppType::Codex && !crate::mcp::should_sync_codex_mcp() {
+                // Match the existing per-server MCP behavior: a missing CLI
+                // directory means Codex CLI has not been initialized, so a
+                // global sync must not create it while syncing another app.
+                Ok(())
+            } else if app == AppType::Codex {
+                Self::preflight_codex_live_rewrite(state)
+                    .and_then(|preflight| Self::sync_codex_after_live_rewrite(state, preflight))
+            } else {
+                Self::project_servers_to_app(state, &servers, &app)
+            };
+            if let Err(err) = result {
                 log::warn!("同步 MCP 到 {app:?} 失败: {err}");
                 failures.push(format!("{}: {err}", app.as_str()));
             }
@@ -223,6 +267,10 @@ impl McpService {
     /// 只把启用状态投影到单个应用。某个应用的 live 被整体重写后用它做
     /// 定向重投影，避免把无关应用的失败面（如 ~/.claude.json 坏 JSON）
     /// 牵连进目标应用的关键路径。
+    ///
+    /// Codex provider rewrites must call `preflight_codex_live_rewrite` before
+    /// writing and `sync_codex_after_live_rewrite` afterwards. This generic
+    /// helper intentionally does not infer ownership from post-write files.
     pub fn sync_enabled_for_app(state: &AppState, app: &AppType) -> Result<(), AppError> {
         if matches!(
             app,
@@ -230,12 +278,163 @@ impl McpService {
         ) {
             return Ok(());
         }
+        if matches!(app, AppType::Codex) {
+            if !crate::mcp::should_sync_codex_mcp() {
+                return Ok(());
+            }
+            let preflight = Self::preflight_codex_live_rewrite(state)?;
+            return Self::sync_codex_after_live_rewrite(state, preflight);
+        }
         let servers = Self::get_all_servers(state)?;
         Self::project_servers_to_app(state, &servers, app)
     }
 
-    fn project_servers_to_app(
+    /// Inspect Codex MCP ownership before a provider replaces CLI
+    /// `config.toml`, then capture the authoritative CLI projection.
+    ///
+    /// Entries owned by the Desktop runtime or another external writer are
+    /// retained separately from the authoritative CLI database projection.
+    pub fn preflight_codex_live_rewrite(
         state: &AppState,
+    ) -> Result<CodexMcpLiveRewritePreflight, AppError> {
+        Self::preflight_codex_live_rewrite_with_db(state.db.as_ref())
+    }
+
+    /// Database-only variant used by live writers that do not own an
+    /// `AppState` (for example proxy takeover restore).
+    pub fn preflight_codex_live_rewrite_with_db(
+        db: &Database,
+    ) -> Result<CodexMcpLiveRewritePreflight, AppError> {
+        let servers = db.get_all_mcp_servers()?;
+        let preserved_live =
+            crate::mcp::capture_codex_mcp_live_snapshot_for(crate::codex_config::CodexTarget::Cli)?;
+        Self::build_codex_live_rewrite_preflight(servers, preserved_live)
+    }
+
+    /// Restore-only variant of [`Self::preflight_codex_live_rewrite_with_db`].
+    ///
+    /// A damaged `config.toml` must not prevent proxy shutdown from restoring
+    /// the provider/auth state saved in the takeover backup.  The normal
+    /// preflight remains strict so ordinary provider writes still surface the
+    /// malformed TOML instead of silently replacing it.  During restore, when
+    /// the only failure is parsing the current Codex config, use an empty live
+    /// MCP snapshot and project the database-owned CLI entries after the
+    /// backup has been written.  Non-parse errors (I/O, database, path
+    /// isolation, etc.) continue to fail the restore.
+    pub fn preflight_codex_live_rewrite_for_restore_with_db(
+        db: &Database,
+    ) -> Result<CodexMcpLiveRewritePreflight, AppError> {
+        match Self::preflight_codex_live_rewrite_with_db(db) {
+            Ok(preflight) => Ok(preflight),
+            Err(error) if Self::is_codex_live_config_parse_error(&error) => {
+                log::warn!(
+                    "Codex Live config.toml 无法解析，恢复时将使用空 MCP 快照并重建 CLI MCP: {error}"
+                );
+                Self::build_codex_live_rewrite_preflight(
+                    db.get_all_mcp_servers()?,
+                    crate::mcp::CodexMcpLiveSnapshot::default(),
+                )
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn is_codex_live_config_parse_error(error: &AppError) -> bool {
+        match error {
+            // `read_and_validate_codex_config_text_for` reports TOML syntax
+            // errors through this typed variant.
+            AppError::Toml { .. } => true,
+            // `toml_edit` can reject text that the `toml` validator accepted;
+            // the capture helper wraps that second parse in McpValidation.
+            AppError::McpValidation(message) => message.starts_with("解析 Codex config.toml 失败:"),
+            _ => false,
+        }
+    }
+
+    fn build_codex_live_rewrite_preflight(
+        servers: IndexMap<String, McpServer>,
+        mut preserved_live: crate::mcp::CodexMcpLiveSnapshot,
+    ) -> Result<CodexMcpLiveRewritePreflight, AppError> {
+        let shared_directory = crate::codex_config::codex_config_dirs_conflict();
+        let live_desktop_runtime_ids = preserved_live
+            .iter()
+            .filter_map(|(id, item)| {
+                crate::mcp::is_codex_desktop_runtime_mcp_item(id, item).then_some(id.to_string())
+            })
+            .collect::<std::collections::HashSet<_>>();
+
+        let legacy_cli_flags_to_clear = servers
+            .values()
+            .filter_map(|server| {
+                (server.apps.codex
+                    && (crate::mcp::is_codex_desktop_runtime_mcp_spec(&server.id, &server.server)
+                        || live_desktop_runtime_ids.contains(&server.id)))
+                .then_some(server.id.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut projected_servers = servers.clone();
+        for id in &legacy_cli_flags_to_clear {
+            if let Some(server) = projected_servers.get_mut(id) {
+                server.apps.codex = false;
+            }
+        }
+
+        preserved_live.retain(|id, item| {
+            let desktop_runtime = crate::mcp::is_codex_desktop_runtime_mcp_item(id, item);
+            if desktop_runtime {
+                // A runtime entry in an isolated CLI directory is historical
+                // contamination and should disappear on the next CLI rewrite.
+                return shared_directory;
+            }
+            match servers.get(id) {
+                Some(server) if server.apps.codex => false,
+                // In a shared file a DB-disabled ID can still belong to
+                // Desktop. Direct CLI disable already removes its own entry.
+                Some(_) => false,
+                None => true,
+            }
+        });
+
+        Ok(CodexMcpLiveRewritePreflight {
+            servers: projected_servers,
+            preserved_live,
+            legacy_cli_flags_to_clear,
+        })
+    }
+
+    /// Re-project Codex CLI MCP after a provider live rewrite using only the
+    /// preflight snapshot. No CLI/Desktop live file is read for ownership here.
+    pub fn sync_codex_after_live_rewrite(
+        state: &AppState,
+        preflight: CodexMcpLiveRewritePreflight,
+    ) -> Result<(), AppError> {
+        Self::sync_codex_after_live_rewrite_with_db(state.db.as_ref(), preflight)
+    }
+
+    /// Database-only counterpart for callers that perform the live rewrite
+    /// without an `AppState`. The preflight token remains the sole projection
+    /// source; the database and live files are deliberately not re-read.
+    pub fn sync_codex_after_live_rewrite_with_db(
+        db: &Database,
+        preflight: CodexMcpLiveRewritePreflight,
+    ) -> Result<(), AppError> {
+        crate::mcp::write_codex_mcp_projection_for(
+            crate::codex_config::CodexTarget::Cli,
+            &preflight.preserved_live,
+            &preflight.servers,
+        )?;
+        Self::finalize_legacy_codex_desktop_runtime_mcp(db, &preflight.legacy_cli_flags_to_clear)
+    }
+
+    fn project_servers_to_app(
+        _state: &AppState,
+        servers: &IndexMap<String, McpServer>,
+        app: &AppType,
+    ) -> Result<(), AppError> {
+        Self::project_servers_to_app_no_state(servers, app)
+    }
+
+    fn project_servers_to_app_no_state(
         servers: &IndexMap<String, McpServer>,
         app: &AppType,
     ) -> Result<(), AppError> {
@@ -248,9 +447,9 @@ impl McpService {
 
         for server in servers.values() {
             if server.apps.is_enabled_for(app) {
-                Self::sync_server_to_app(state, server, app)?;
+                Self::sync_server_to_app_no_config(server, app)?;
             } else {
-                Self::remove_server_from_app(state, &server.id, app)?;
+                Self::remove_server_from_app_no_config(&server.id, app)?;
             }
         }
 
@@ -345,11 +544,29 @@ impl McpService {
 
     /// 从 Codex 导入 MCP（v3.7.0 已更新为统一结构）
     pub fn import_from_codex(state: &AppState) -> Result<usize, AppError> {
+        // Import is read-only for the live file, but a shared CLI/Desktop
+        // file is still ambiguous when it contains MCP.  Reuse the same
+        // preflight as rewrite paths: an empty shared file remains compatible
+        // with the historical default directory, while an MCP-bearing one is
+        // rejected before any database row is changed.
+        let preflight = Self::preflight_codex_live_rewrite(state)?;
+
         // 创建临时 MultiAppConfig 用于导入
         let mut temp_config = crate::app_config::MultiAppConfig::default();
 
         // 调用原有的导入逻辑（从 mcp.rs）
-        let count = crate::mcp::import_from_codex(&mut temp_config)?;
+        let count = crate::mcp::import_from_codex_for(
+            &mut temp_config,
+            crate::codex_config::CodexTarget::Cli,
+        )?;
+
+        // Import is read-only for live files. Commit the historical cleanup
+        // only after the CLI file parsed successfully; a failed read leaves
+        // the database untouched.
+        Self::finalize_legacy_codex_desktop_runtime_mcp(
+            state.db.as_ref(),
+            &preflight.legacy_cli_flags_to_clear,
+        )?;
 
         let mut new_count = 0;
 
@@ -379,6 +596,17 @@ impl McpService {
         }
 
         Ok(new_count)
+    }
+
+    fn finalize_legacy_codex_desktop_runtime_mcp(
+        db: &Database,
+        ids: &[String],
+    ) -> Result<(), AppError> {
+        for id in ids {
+            log::info!("清理 Codex Desktop runtime MCP '{id}' 的历史 CLI 启用状态");
+            let _ = db.update_mcp_server_app_enabled(id, &AppType::Codex, false)?;
+        }
+        Ok(())
     }
 
     /// 从 Gemini 导入 MCP（v3.7.0 已更新为统一结构）

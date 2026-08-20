@@ -178,7 +178,50 @@ impl ConfigService {
         provider_id: &str,
         provider: &Provider,
     ) -> Result<(), AppError> {
-        let settings = provider.settings_config.as_object().ok_or_else(|| {
+        // Legacy import/export synchronization does not have the current MCP
+        // database projection available. Preserve the raw pre-write table so
+        // a shared Codex Desktop runtime (or another external MCP writer) is
+        // not erased by the provider-level config replacement.
+        let mut mcp_snapshot = (target == crate::codex_config::CodexTarget::Cli)
+            .then(|| crate::mcp::capture_codex_mcp_live_snapshot_for(target))
+            .transpose()?;
+        if target == crate::codex_config::CodexTarget::Cli
+            && !crate::codex_config::codex_config_dirs_conflict()
+        {
+            if let Some(snapshot) = mcp_snapshot.as_mut() {
+                // An isolated CLI file must not retain a Desktop runtime entry
+                // left behind by older versions. Shared directories keep it
+                // because the Desktop process still owns that physical file.
+                snapshot
+                    .retain(|id, item| !crate::mcp::is_codex_desktop_runtime_mcp_item(id, item));
+            }
+        }
+        let live_snapshot = (target == crate::codex_config::CodexTarget::Cli)
+            .then(|| crate::codex_config::CodexLiveStateSnapshot::capture_for(target))
+            .transpose()?;
+
+        // Legacy config sync can still receive a provider snapshot created by
+        // an older build.  MCP belongs to the CLI database projection, so
+        // sanitize only the CLI payload before replacing config.toml.  Desktop
+        // runtime configuration is intentionally passed through unchanged.
+        let mut sanitized_settings = provider.settings_config.clone();
+        let had_config_before_mcp_strip = sanitized_settings
+            .get("config")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty());
+        let mcp_was_stripped = if target == crate::codex_config::CodexTarget::Cli {
+            crate::codex_config::strip_codex_mcp_servers_from_settings(&mut sanitized_settings)?
+        } else {
+            false
+        };
+        let config_was_mcp_only = had_config_before_mcp_strip
+            && mcp_was_stripped
+            && sanitized_settings
+                .get("config")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.trim().is_empty());
+
+        let settings = sanitized_settings.as_object().ok_or_else(|| {
             AppError::Config(format!("供应商 {provider_id} 的 Codex 配置必须是对象"))
         })?;
         let auth = settings.get("auth").ok_or_else(|| {
@@ -193,19 +236,55 @@ impl ConfigService {
 
         let profile = crate::proxy::providers::resolve_codex_catalog_tool_profile(provider);
 
-        crate::codex_config::write_codex_provider_live_with_catalog_for(
-            target,
-            &provider.settings_config,
-            provider.category.as_deref(),
-            auth,
-            cfg_text,
-            profile,
-        )?;
-        // 注意：MCP 同步在 v3.7.0 中已通过 McpService 进行，不再在此调用
-        // sync_enabled_to_codex 使用旧的 config.mcp.codex 结构，在新架构中为空
-        // MCP 的启用/禁用应通过 McpService::toggle_app 进行
+        if config_was_mcp_only {
+            crate::codex_config::write_codex_provider_live_with_catalog_after_mcp_strip(
+                target,
+                &sanitized_settings,
+                provider.category.as_deref(),
+                auth,
+                cfg_text,
+                profile,
+            )?;
+        } else {
+            crate::codex_config::write_codex_provider_live_with_catalog_for(
+                target,
+                &sanitized_settings,
+                provider.category.as_deref(),
+                auth,
+                cfg_text,
+                profile,
+            )?;
+        }
 
-        let cfg_text_after = crate::codex_config::read_and_validate_codex_config_text_for(target)?;
+        if let Some(mcp_snapshot) = mcp_snapshot.as_ref() {
+            if let Err(error) = crate::mcp::write_codex_mcp_projection_for(
+                target,
+                mcp_snapshot,
+                &Default::default(),
+            ) {
+                if let Some(live_snapshot) = live_snapshot.as_ref() {
+                    return match live_snapshot.restore_preserving_newer_same_account_auth() {
+                        Ok(()) => Err(error),
+                        Err(rollback_error) => Err(AppError::Message(format!(
+                            "恢复 Codex legacy 同步前状态失败: {rollback_error}; 原始错误: {error}"
+                        ))),
+                    };
+                }
+                return Err(error);
+            }
+        }
+
+        let mut cfg_text_after =
+            crate::codex_config::read_and_validate_codex_config_text_for(target)?;
+        if target == crate::codex_config::CodexTarget::Cli {
+            let mut backfill = serde_json::json!({ "config": cfg_text_after });
+            crate::codex_config::strip_codex_mcp_servers_from_settings(&mut backfill)?;
+            cfg_text_after = backfill
+                .get("config")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+        }
         if let Some(manager) = config.get_manager_mut(app_type) {
             if let Some(target) = manager.providers.get_mut(provider_id) {
                 if let Some(obj) = target.settings_config.as_object_mut() {

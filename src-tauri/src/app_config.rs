@@ -26,7 +26,10 @@ impl McpApps {
     pub fn is_enabled_for(&self, app: &AppType) -> bool {
         match app {
             AppType::Claude => self.claude,
-            AppType::Codex | AppType::CodexDesktop => self.codex,
+            AppType::Codex => self.codex,
+            // Codex Desktop owns its MCP configuration at runtime.  It is
+            // intentionally outside CC Switch's shared MCP state.
+            AppType::CodexDesktop => false,
             AppType::Gemini => self.gemini,
             AppType::GrokBuild => self.grokbuild,
             AppType::OpenCode => self.opencode,
@@ -41,7 +44,9 @@ impl McpApps {
     pub fn set_enabled_for(&mut self, app: &AppType, enabled: bool) {
         match app {
             AppType::Claude => self.claude = enabled,
-            AppType::Codex | AppType::CodexDesktop => self.codex = enabled,
+            AppType::Codex => self.codex = enabled,
+            // Do not project a CLI MCP toggle into Codex Desktop.
+            AppType::CodexDesktop => {}
             AppType::Gemini => self.gemini = enabled,
             AppType::GrokBuild => self.grokbuild = enabled,
             AppType::OpenCode => self.opencode = enabled,
@@ -1026,6 +1031,16 @@ mod tests {
     use std::env;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn codex_desktop_is_not_part_of_cli_mcp_state() {
+        let mut apps = McpApps::default();
+        apps.set_enabled_for(&AppType::CodexDesktop, true);
+
+        assert!(!apps.codex);
+        assert!(!apps.is_enabled_for(&AppType::CodexDesktop));
+        assert!(apps.enabled_apps().is_empty());
+    }
 
     #[test]
     fn app_type_parses_claude_desktop_aliases() {

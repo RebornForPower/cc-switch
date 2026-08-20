@@ -84,7 +84,11 @@ vi.mock("@/components/providers/forms/CodexOAuthSection", () => ({
 }));
 
 vi.mock("@/components/providers/forms/CodexConfigEditor", () => ({
-  default: () => <div data-testid="codex-config-editor" />,
+  default: ({ showCommonConfig }: { showCommonConfig?: boolean }) => (
+    <output data-testid="codex-config-editor-common-config">
+      {showCommonConfig ? "enabled" : "disabled"}
+    </output>
+  ),
 }));
 
 vi.mock("@/components/providers/forms/ProviderAdvancedConfig", () => ({
@@ -248,12 +252,17 @@ describe("ProviderForm Codex Official managed account", () => {
     const onSubmit = vi.fn();
     renderCodexDesktopForm(onSubmit);
 
+    expect(
+      screen.getByTestId("codex-config-editor-common-config"),
+    ).toHaveTextContent("disabled");
+
     await user.click(screen.getByRole("combobox", { name: "接入方式" }));
     await user.click(await screen.findByRole("option", { name: "本地网关" }));
     await user.click(screen.getByRole("button", { name: "save-provider" }));
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
     expect(onSubmit.mock.calls[0][0].meta?.codexDesktopMode).toBe("proxy");
+    expect(onSubmit.mock.calls[0][0].meta?.commonConfigEnabled).toBeUndefined();
   });
 
   it("describes native login using the Codex Desktop auth file", () => {

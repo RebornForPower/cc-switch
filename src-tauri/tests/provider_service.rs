@@ -1,8 +1,10 @@
 use serde_json::json;
+use std::path::Path;
 
 use cc_switch_lib::{
-    get_claude_settings_path, read_json_file, write_codex_live_atomic, AppError, AppType, McpApps,
-    McpServer, MultiAppConfig, Provider, ProviderMeta, ProviderService,
+    get_claude_settings_path, read_json_file, update_settings, write_codex_live_atomic, AppError,
+    AppSettings, AppType, McpApps, McpServer, MultiAppConfig, Provider, ProviderMeta,
+    ProviderService,
 };
 
 #[path = "support.rs"]
@@ -20,6 +22,137 @@ fn sanitize_provider_name(name: &str) -> String {
         })
         .collect::<String>()
         .to_lowercase()
+}
+
+const DESKTOP_NODE_REPL_CONFIG: &str = r#"[mcp_servers.node_repl]
+type = "stdio"
+command = 'C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node_repl.exe'
+
+[mcp_servers.node_repl.env]
+BROWSER_USE_CODEX_APP_BUILD_FLAVOR = "prod"
+NODE_REPL_NODE_PATH = 'C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node.exe'
+SKY_CUA_NATIVE_PIPE = "1"
+"#;
+
+fn configure_codex_directories(cli_dir: &Path, desktop_dir: &Path, current_provider: Option<&str>) {
+    update_settings(AppSettings {
+        codex_config_dir: Some(cli_dir.to_string_lossy().into_owned()),
+        codex_desktop_config_dir: Some(desktop_dir.to_string_lossy().into_owned()),
+        current_provider_codex: current_provider.map(str::to_string),
+        ..AppSettings::default()
+    })
+    .expect("configure Codex test directories");
+}
+
+fn persisted_codex_current(home: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(home.join(".cc-switch").join("settings.json"))
+        .expect("read persisted settings");
+    serde_json::from_str::<AppSettings>(&text)
+        .expect("parse persisted settings")
+        .current_provider_codex
+}
+
+fn codex_provider(id: &str, name: &str, marker: &str) -> Provider {
+    Provider::with_id(
+        id.to_string(),
+        name.to_string(),
+        json!({
+            "auth": { "OPENAI_API_KEY": format!("sk-{id}") },
+            "config": format!(
+                "test_marker = \"{marker}\"\nmodel_provider = \"{id}\"\n\n[model_providers.{id}]\nname = \"{name}\"\nbase_url = \"https://{id}.example/v1\"\nwire_api = \"responses\"\n"
+            )
+        }),
+        None,
+    )
+}
+
+fn codex_mcp_server(id: &str, command: &str) -> McpServer {
+    McpServer {
+        id: id.to_string(),
+        name: id.to_string(),
+        server: json!({
+            "type": "stdio",
+            "command": command,
+        }),
+        apps: McpApps {
+            codex: true,
+            ..McpApps::default()
+        },
+        description: None,
+        homepage: None,
+        docs: None,
+        tags: Vec::new(),
+    }
+}
+
+fn codex_desktop_runtime_node_repl_server() -> McpServer {
+    McpServer {
+        id: "node_repl".to_string(),
+        name: "node_repl".to_string(),
+        server: json!({
+            "type": "stdio",
+            "command": r"C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node_repl.exe",
+            "env": {
+                "BROWSER_USE_CODEX_APP_BUILD_FLAVOR": "prod",
+                "NODE_REPL_NODE_PATH": r"C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node.exe",
+                "SKY_CUA_NATIVE_PIPE": "1"
+            }
+        }),
+        apps: McpApps {
+            codex: true,
+            ..McpApps::default()
+        },
+        description: None,
+        homepage: None,
+        docs: None,
+        tags: Vec::new(),
+    }
+}
+
+#[test]
+fn list_codex_providers_hides_legacy_mcp_projection_without_mutating_database() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let _home = ensure_test_home();
+    let state = create_test_state().expect("create test state");
+    let provider = Provider::with_id(
+        "legacy-mcp-provider".to_string(),
+        "Legacy MCP Provider".to_string(),
+        json!({
+            "auth": { "OPENAI_API_KEY": "sk-test" },
+            "config": "model = \"gpt-test\"\n\n[mcp_servers.node_repl]\ntype = \"stdio\"\ncommand = \"node_repl.exe\"\n"
+        }),
+        None,
+    );
+    state
+        .db
+        .save_provider(AppType::Codex.as_str(), &provider)
+        .expect("seed legacy Codex provider");
+
+    let listed = ProviderService::list(&state, AppType::Codex).expect("list Codex providers");
+    let visible_config = listed["legacy-mcp-provider"]
+        .settings_config
+        .get("config")
+        .and_then(serde_json::Value::as_str)
+        .expect("visible config");
+    assert!(
+        !visible_config.contains("mcp_servers"),
+        "the CLI editor must not receive a legacy MCP projection"
+    );
+
+    let stored = state
+        .db
+        .get_provider_by_id("legacy-mcp-provider", AppType::Codex.as_str())
+        .expect("read stored provider")
+        .expect("stored provider exists");
+    assert!(
+        stored
+            .settings_config
+            .get("config")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|config| config.contains("mcp_servers")),
+        "listing must not mutate historical provider data before the user saves"
+    );
 }
 
 #[test]
@@ -1041,6 +1174,475 @@ fn read_codex_live_settings_tolerates_missing_auth_when_config_file_exists() {
         .expect("config file present but empty must be readable");
     assert_eq!(live.get("auth"), Some(&json!({})));
     assert_eq!(live.get("config").and_then(|v| v.as_str()), Some(""));
+}
+
+#[test]
+fn update_current_codex_with_shared_desktop_mcp_preserves_runtime_mcp() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let shared_dir = home.join("codex-shared-update-current");
+    configure_codex_directories(&shared_dir, &shared_dir, Some("current"));
+    std::fs::create_dir_all(&shared_dir).expect("create shared Codex directory");
+    let config_path = shared_dir.join("config.toml");
+    std::fs::write(&config_path, DESKTOP_NODE_REPL_CONFIG).expect("seed Desktop runtime config");
+
+    let original = codex_provider("current", "Current", "stored-original");
+    let mut config = MultiAppConfig::default();
+    {
+        let manager = config
+            .get_manager_mut(&AppType::Codex)
+            .expect("Codex manager");
+        manager.current = original.id.clone();
+        manager
+            .providers
+            .insert(original.id.clone(), original.clone());
+    }
+    let state = create_test_state_with_config(&config).expect("create test state");
+    state
+        .db
+        .save_mcp_server(&codex_mcp_server("node_repl", "desktop-node-repl"))
+        .expect("seed stale Codex MCP ownership");
+
+    let updated = codex_provider("current", "Current Updated", "must-not-be-written");
+    ProviderService::update(&state, AppType::Codex, None, updated.clone())
+        .expect("CLI provider update must work in a shared directory");
+
+    let live = std::fs::read_to_string(&config_path).expect("read live after update");
+    assert!(live.contains("must-not-be-written"));
+    assert!(live.contains("[mcp_servers.node_repl]"));
+    let stored = state
+        .db
+        .get_provider_by_id("current", AppType::Codex.as_str())
+        .expect("read provider after rejected update")
+        .expect("current provider remains");
+    assert_eq!(stored.name, updated.name);
+    assert_eq!(stored.settings_config, updated.settings_config);
+    assert_eq!(
+        state
+            .db
+            .get_current_provider(AppType::Codex.as_str())
+            .expect("read DB current")
+            .as_deref(),
+        Some("current")
+    );
+    assert_eq!(persisted_codex_current(home).as_deref(), Some("current"));
+}
+
+#[test]
+fn switch_codex_with_shared_desktop_mcp_preserves_runtime_mcp() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let shared_dir = home.join("codex-shared-switch");
+    configure_codex_directories(&shared_dir, &shared_dir, Some("a"));
+    std::fs::create_dir_all(&shared_dir).expect("create shared Codex directory");
+    let config_path = shared_dir.join("config.toml");
+    let live_with_backfill_sentinel =
+        format!("live_only = \"must-not-backfill\"\n\n{DESKTOP_NODE_REPL_CONFIG}");
+    std::fs::write(&config_path, &live_with_backfill_sentinel)
+        .expect("seed shared Desktop runtime config");
+
+    let provider_a = codex_provider("a", "Provider A", "stored-a");
+    let provider_b = codex_provider("b", "Provider B", "stored-b");
+    let mut config = MultiAppConfig::default();
+    {
+        let manager = config
+            .get_manager_mut(&AppType::Codex)
+            .expect("Codex manager");
+        manager.current = provider_a.id.clone();
+        manager
+            .providers
+            .insert(provider_a.id.clone(), provider_a.clone());
+        manager
+            .providers
+            .insert(provider_b.id.clone(), provider_b.clone());
+    }
+    let state = create_test_state_with_config(&config).expect("create test state");
+    state
+        .db
+        .save_mcp_server(&codex_mcp_server("node_repl", "desktop-node-repl"))
+        .expect("seed stale Codex MCP ownership");
+
+    ProviderService::switch(&state, AppType::Codex, "b")
+        .expect("CLI provider switch must work in a shared directory");
+    let live = std::fs::read_to_string(&config_path).expect("read live after switch");
+    assert!(live.contains("stored-b"));
+    assert!(live.contains("[mcp_servers.node_repl]"));
+    let stored_a = state
+        .db
+        .get_provider_by_id("a", AppType::Codex.as_str())
+        .expect("read provider A")
+        .expect("provider A remains");
+    assert_eq!(
+        stored_a
+            .settings_config
+            .get("config")
+            .and_then(|value| value.as_str()),
+        Some("live_only = \"must-not-backfill\"\n"),
+        "switch backfills the outgoing provider from the live file before writing the target"
+    );
+    assert_eq!(
+        state
+            .db
+            .get_current_provider(AppType::Codex.as_str())
+            .expect("read DB current")
+            .as_deref(),
+        Some("b")
+    );
+    assert_eq!(persisted_codex_current(home).as_deref(), Some("b"));
+}
+
+#[test]
+fn add_first_codex_provider_with_shared_desktop_mcp_preserves_runtime_mcp() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let shared_dir = home.join("codex-shared-add-first");
+    configure_codex_directories(&shared_dir, &shared_dir, None);
+    std::fs::create_dir_all(&shared_dir).expect("create shared Codex directory");
+    let config_path = shared_dir.join("config.toml");
+    std::fs::write(&config_path, DESKTOP_NODE_REPL_CONFIG).expect("seed Desktop runtime config");
+
+    let state = create_test_state().expect("create test state");
+    state
+        .db
+        .save_mcp_server(&codex_mcp_server("node_repl", "desktop-node-repl"))
+        .expect("seed stale Codex MCP ownership");
+    let provider = codex_provider("first", "First Provider", "must-not-be-written");
+    ProviderService::add(&state, AppType::Codex, provider.clone(), false)
+        .expect("first CLI provider add must work in a shared directory");
+
+    let live = std::fs::read_to_string(&config_path).expect("read live after add");
+    assert!(live.contains("must-not-be-written"));
+    assert!(live.contains("[mcp_servers.node_repl]"));
+    assert!(state
+        .db
+        .get_provider_by_id("first", AppType::Codex.as_str())
+        .expect("read provider after add")
+        .is_some());
+    assert_eq!(
+        state
+            .db
+            .get_current_provider(AppType::Codex.as_str())
+            .expect("read DB current"),
+        Some("first".to_string())
+    );
+    assert_eq!(persisted_codex_current(home), None);
+}
+
+#[test]
+fn update_non_current_codex_is_allowed_with_shared_directory() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let shared_dir = home.join("codex-shared-update-non-current");
+    configure_codex_directories(&shared_dir, &shared_dir, Some("a"));
+    std::fs::create_dir_all(&shared_dir).expect("create shared Codex directory");
+    let config_path = shared_dir.join("config.toml");
+    std::fs::write(&config_path, DESKTOP_NODE_REPL_CONFIG).expect("seed Desktop runtime config");
+
+    let provider_a = codex_provider("a", "Provider A", "stored-a");
+    let provider_b = codex_provider("b", "Provider B", "stored-b");
+    let mut config = MultiAppConfig::default();
+    {
+        let manager = config
+            .get_manager_mut(&AppType::Codex)
+            .expect("Codex manager");
+        manager.current = provider_a.id.clone();
+        manager.providers.insert(provider_a.id.clone(), provider_a);
+        manager.providers.insert(provider_b.id.clone(), provider_b);
+    }
+    let state = create_test_state_with_config(&config).expect("create test state");
+    state
+        .db
+        .save_mcp_server(&codex_mcp_server("node_repl", "desktop-node-repl"))
+        .expect("seed stale Codex MCP ownership");
+    let live_before = std::fs::read(&config_path).expect("capture live before update");
+
+    let updated_b = codex_provider("b", "Provider B Updated", "db-only-update");
+    ProviderService::update(&state, AppType::Codex, None, updated_b.clone())
+        .expect("non-current provider edit must remain a DB-only operation");
+
+    assert_eq!(
+        std::fs::read(&config_path).expect("read live after non-current update"),
+        live_before,
+        "non-current provider edit must not touch the shared live file"
+    );
+    let stored_b = state
+        .db
+        .get_provider_by_id("b", AppType::Codex.as_str())
+        .expect("read provider B")
+        .expect("provider B remains");
+    assert_eq!(stored_b.name, updated_b.name);
+    assert_eq!(stored_b.settings_config, updated_b.settings_config);
+    assert_eq!(
+        state
+            .db
+            .get_current_provider(AppType::Codex.as_str())
+            .expect("read DB current")
+            .as_deref(),
+        Some("a")
+    );
+    assert_eq!(persisted_codex_current(home).as_deref(), Some("a"));
+}
+
+#[test]
+fn shared_codex_directory_without_enabled_mcp_keeps_legacy_update_flow() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let shared_dir = home.join("codex-shared-no-mcp");
+    configure_codex_directories(&shared_dir, &shared_dir, Some("current"));
+    std::fs::create_dir_all(&shared_dir).expect("create shared Codex directory");
+    let config_path = shared_dir.join("config.toml");
+    std::fs::write(&config_path, "test_marker = \"old-live\"\n")
+        .expect("seed historical CLI live config");
+
+    let original = codex_provider("current", "Current", "stored-original");
+    let mut config = MultiAppConfig::default();
+    {
+        let manager = config
+            .get_manager_mut(&AppType::Codex)
+            .expect("Codex manager");
+        manager.current = original.id.clone();
+        manager.providers.insert(original.id.clone(), original);
+    }
+    let state = create_test_state_with_config(&config).expect("create test state");
+    assert!(state
+        .db
+        .get_all_mcp_servers()
+        .expect("read MCP state")
+        .values()
+        .all(|server| !server.apps.codex));
+
+    let updated = codex_provider("current", "Current Updated", "legacy-flow-allowed");
+    ProviderService::update(&state, AppType::Codex, None, updated.clone())
+        .expect("shared directory without CC Switch-owned MCP must retain legacy CLI behavior");
+
+    let live = std::fs::read_to_string(&config_path).expect("read updated CLI live config");
+    assert!(
+        live.contains("test_marker = \"legacy-flow-allowed\""),
+        "current provider update should still reach live when no Codex MCP is enabled: {live}"
+    );
+    let stored = state
+        .db
+        .get_provider_by_id("current", AppType::Codex.as_str())
+        .expect("read updated provider")
+        .expect("updated provider remains");
+    assert_eq!(stored.name, updated.name);
+    assert_eq!(stored.settings_config, updated.settings_config);
+    assert_eq!(
+        state
+            .db
+            .get_current_provider(AppType::Codex.as_str())
+            .expect("read DB current")
+            .as_deref(),
+        Some("current")
+    );
+    assert_eq!(persisted_codex_current(home).as_deref(), Some("current"));
+}
+
+#[test]
+fn isolated_codex_add_and_update_keep_cli_mcp_out_of_desktop_runtime_config() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let cli_dir = home.join("codex-cli-isolated-provider-save");
+    let desktop_dir = home.join("codex-desktop-isolated-provider-save");
+    configure_codex_directories(&cli_dir, &desktop_dir, None);
+    std::fs::create_dir_all(&cli_dir).expect("create CLI Codex directory");
+    std::fs::create_dir_all(&desktop_dir).expect("create Desktop Codex directory");
+    let cli_config_path = cli_dir.join("config.toml");
+    let desktop_config_path = desktop_dir.join("config.toml");
+    std::fs::write(&cli_config_path, "test_marker = \"old-cli\"\n").expect("seed CLI config");
+    std::fs::write(&desktop_config_path, DESKTOP_NODE_REPL_CONFIG)
+        .expect("seed Desktop runtime config");
+    let desktop_before =
+        std::fs::read(&desktop_config_path).expect("capture Desktop runtime config");
+
+    let state = create_test_state().expect("create test state");
+    state
+        .db
+        .save_mcp_server(&codex_mcp_server("cli_echo", "cli-echo"))
+        .expect("seed CLI-owned MCP");
+
+    let provider = codex_provider("first", "First Provider", "after-add");
+    ProviderService::add(&state, AppType::Codex, provider, false)
+        .expect("first provider add should write only the isolated CLI directory");
+
+    let cli_after_add =
+        std::fs::read_to_string(&cli_config_path).expect("read CLI config after add");
+    assert!(
+        cli_after_add.contains("mcp_servers.cli_echo"),
+        "first provider add must re-project enabled CLI MCP: {cli_after_add}"
+    );
+    assert!(
+        !cli_after_add.contains("node_repl"),
+        "Desktop runtime MCP must never enter isolated CLI config: {cli_after_add}"
+    );
+    assert_eq!(
+        std::fs::read(&desktop_config_path).expect("read Desktop config after add"),
+        desktop_before,
+        "CLI provider add must not touch Desktop runtime config"
+    );
+
+    let updated = codex_provider("first", "First Provider Updated", "after-update");
+    ProviderService::update(&state, AppType::Codex, None, updated)
+        .expect("current provider update should preserve isolated CLI MCP projection");
+
+    let cli_after_update =
+        std::fs::read_to_string(&cli_config_path).expect("read CLI config after update");
+    assert!(
+        cli_after_update.contains("test_marker = \"after-update\""),
+        "updated provider config should reach CLI live: {cli_after_update}"
+    );
+    assert!(
+        cli_after_update.contains("mcp_servers.cli_echo"),
+        "provider update must retain enabled CLI MCP: {cli_after_update}"
+    );
+    assert!(
+        !cli_after_update.contains("node_repl"),
+        "Desktop runtime MCP must not enter CLI config after update: {cli_after_update}"
+    );
+    assert_eq!(
+        std::fs::read(&desktop_config_path).expect("read Desktop config after update"),
+        desktop_before,
+        "CLI provider update must not touch Desktop runtime config"
+    );
+    assert_eq!(
+        state
+            .db
+            .get_current_provider(AppType::Codex.as_str())
+            .expect("read DB current")
+            .as_deref(),
+        Some("first")
+    );
+}
+
+#[test]
+fn codex_mcp_only_provider_save_keeps_cli_config_empty_without_restore() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let cli_dir = home.join("codex-cli-mcp-only-provider");
+    let desktop_dir = home.join("codex-desktop-mcp-only-provider");
+    configure_codex_directories(&cli_dir, &desktop_dir, None);
+    std::fs::create_dir_all(&cli_dir).expect("create CLI Codex directory");
+    std::fs::create_dir_all(&desktop_dir).expect("create Desktop Codex directory");
+    std::fs::write(desktop_dir.join("config.toml"), DESKTOP_NODE_REPL_CONFIG)
+        .expect("seed Desktop runtime config");
+
+    let state = create_test_state().expect("create test state");
+    let provider = Provider::with_id(
+        "mcp-only".to_string(),
+        "MCP only".to_string(),
+        json!({
+            "auth": { "OPENAI_API_KEY": "sk-mcp-only" },
+            "config": DESKTOP_NODE_REPL_CONFIG,
+        }),
+        None,
+    );
+
+    ProviderService::add(&state, AppType::Codex, provider, false)
+        .expect("MCP-only provider should remain writable after sanitization");
+
+    let cli_config =
+        std::fs::read_to_string(cli_dir.join("config.toml")).expect("read sanitized CLI config");
+    assert!(!cli_config.contains("mcp_servers"));
+    assert!(
+        cli_config.trim().is_empty(),
+        "MCP-only CLI config should remain empty after sanitization: {cli_config}"
+    );
+
+    let saved = state
+        .db
+        .get_provider_by_id("mcp-only", AppType::Codex.as_str())
+        .expect("read saved provider")
+        .expect("saved provider exists");
+    assert_eq!(saved.settings_config["config"], json!(""));
+
+    let updated = Provider::with_id(
+        "mcp-only".to_string(),
+        "MCP only updated".to_string(),
+        json!({
+            "auth": { "OPENAI_API_KEY": "sk-mcp-only-updated" },
+            "config": DESKTOP_NODE_REPL_CONFIG,
+        }),
+        None,
+    );
+    ProviderService::update(&state, AppType::Codex, None, updated)
+        .expect("updating an MCP-only provider should remain writable");
+
+    let cli_after_update =
+        std::fs::read_to_string(cli_dir.join("config.toml")).expect("read CLI config after update");
+    assert!(!cli_after_update.contains("mcp_servers"));
+    assert!(cli_after_update.trim().is_empty());
+    assert!(std::fs::read_to_string(desktop_dir.join("config.toml"))
+        .expect("read Desktop runtime config")
+        .contains("node_repl"));
+}
+
+#[test]
+fn codex_cli_save_does_not_restore_legacy_desktop_runtime_node_repl() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let cli_dir = home.join("codex-cli-legacy-runtime-cleanup");
+    let desktop_dir = home.join("codex-desktop-legacy-runtime-cleanup");
+    configure_codex_directories(&cli_dir, &desktop_dir, Some("current"));
+    std::fs::create_dir_all(&cli_dir).expect("create CLI Codex directory");
+    std::fs::create_dir_all(&desktop_dir).expect("create Desktop Codex directory");
+    let cli_config_path = cli_dir.join("config.toml");
+    let desktop_config_path = desktop_dir.join("config.toml");
+    std::fs::write(&cli_config_path, "test_marker = \"user-removed-mcp\"\n")
+        .expect("seed CLI config after the user removed Desktop MCP");
+    std::fs::write(&desktop_config_path, DESKTOP_NODE_REPL_CONFIG)
+        .expect("seed Desktop runtime config");
+    let desktop_before =
+        std::fs::read(&desktop_config_path).expect("capture Desktop runtime config");
+
+    let current = codex_provider("current", "Current", "stored-before-save");
+    let mut config = MultiAppConfig::default();
+    {
+        let manager = config
+            .get_manager_mut(&AppType::Codex)
+            .expect("Codex manager");
+        manager.current = current.id.clone();
+        manager.providers.insert(current.id.clone(), current);
+    }
+    let state = create_test_state_with_config(&config).expect("create test state");
+    state
+        .db
+        .save_mcp_server(&codex_desktop_runtime_node_repl_server())
+        .expect("seed historical Desktop MCP pollution");
+
+    let updated = codex_provider("current", "Current Updated", "saved-without-runtime-mcp");
+    ProviderService::update(&state, AppType::Codex, None, updated)
+        .expect("saving the CLI provider should clean historical Desktop MCP ownership");
+
+    let cli_after = std::fs::read_to_string(&cli_config_path).expect("read CLI config after save");
+    assert!(cli_after.contains("test_marker = \"saved-without-runtime-mcp\""));
+    assert!(
+        !cli_after.contains("node_repl"),
+        "Desktop runtime MCP must not be restored into CLI config: {cli_after}"
+    );
+    assert_eq!(
+        std::fs::read(&desktop_config_path).expect("read Desktop config after CLI save"),
+        desktop_before,
+        "CLI save must not alter Desktop runtime config"
+    );
+    assert!(
+        !state
+            .db
+            .get_all_mcp_servers()
+            .expect("read MCP state")
+            .get("node_repl")
+            .expect("runtime record remains")
+            .apps
+            .codex,
+        "historical Desktop runtime entry must no longer be projected to CLI"
+    );
 }
 
 #[test]
@@ -2547,8 +3149,8 @@ command = "ghost-cmd"
         "provider A's bearer token must not leak into B's live, got: {live_after}"
     );
     assert!(
-        !live_after.contains("mcp_servers"),
-        "no DB-enabled MCP servers, so live must not resurrect stale entries, got: {live_after}"
+        live_after.contains("[mcp_servers.echo]"),
+        "an external canonical MCP entry must survive a provider rewrite, got: {live_after}"
     );
     assert!(
         !live_after.contains("ghost-legacy"),

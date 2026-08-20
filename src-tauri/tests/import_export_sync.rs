@@ -145,6 +145,261 @@ fn sync_codex_provider_writes_config_without_touching_auth() {
 }
 
 #[test]
+fn sync_codex_provider_strips_incoming_mcp_without_touching_desktop_runtime() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let cli_dir = home.join("codex-cli-incoming-mcp");
+    let desktop_dir = home.join("codex-desktop-incoming-mcp");
+    update_settings(AppSettings {
+        codex_config_dir: Some(cli_dir.to_string_lossy().into_owned()),
+        codex_desktop_config_dir: Some(desktop_dir.to_string_lossy().into_owned()),
+        ..Default::default()
+    })
+    .expect("set isolated Codex directories");
+    fs::create_dir_all(&cli_dir).expect("create CLI directory");
+    fs::create_dir_all(&desktop_dir).expect("create Desktop directory");
+
+    let desktop_original = r#"model = "desktop"
+
+[mcp_servers.node_repl]
+command = "desktop-node-repl.exe"
+"#;
+    fs::write(desktop_dir.join("config.toml"), desktop_original)
+        .expect("seed Desktop runtime config");
+
+    let mut config = MultiAppConfig::default();
+    let provider = Provider::with_id(
+        "codex-incoming-mcp".to_string(),
+        "Codex Incoming MCP".to_string(),
+        json!({
+            "auth": { "OPENAI_API_KEY": "codex-key" },
+            "config": r#"model = "cli"
+
+[mcp_servers.node_repl]
+command = "desktop-node-repl.exe"
+"#
+        }),
+        None,
+    );
+    let manager = config
+        .get_manager_mut(&AppType::Codex)
+        .expect("codex manager");
+    manager.current = provider.id.clone();
+    manager.providers.insert(provider.id.clone(), provider);
+
+    ConfigService::sync_current_providers_to_live(&mut config).expect("sync Codex CLI");
+
+    let cli_config =
+        fs::read_to_string(cli_dir.join("config.toml")).expect("read sanitized CLI config");
+    assert!(
+        !cli_config.contains("mcp_servers"),
+        "incoming provider MCP must not be written to CLI config: {cli_config}"
+    );
+    assert_eq!(
+        fs::read_to_string(desktop_dir.join("config.toml")).expect("read unchanged Desktop config"),
+        desktop_original,
+        "Desktop runtime MCP must remain untouched"
+    );
+
+    let stored = config
+        .get_manager(&AppType::Codex)
+        .and_then(|manager| manager.providers.get("codex-incoming-mcp"))
+        .expect("stored Codex provider");
+    assert!(
+        !stored
+            .settings_config
+            .get("config")
+            .and_then(|value| value.as_str())
+            .is_some_and(|config| config.contains("mcp_servers")),
+        "legacy sync backfill must not retain incoming MCP"
+    );
+}
+
+#[test]
+fn legacy_codex_sync_drops_desktop_runtime_mcp_left_in_isolated_cli_config() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let cli_dir = home.join("codex-cli-legacy-runtime-mcp");
+    let desktop_dir = home.join("codex-desktop-legacy-runtime-mcp");
+    update_settings(AppSettings {
+        codex_config_dir: Some(cli_dir.to_string_lossy().into_owned()),
+        codex_desktop_config_dir: Some(desktop_dir.to_string_lossy().into_owned()),
+        ..Default::default()
+    })
+    .expect("set isolated Codex directories");
+    fs::create_dir_all(&cli_dir).expect("create CLI directory");
+    fs::create_dir_all(&desktop_dir).expect("create Desktop directory");
+
+    let desktop_runtime = r#"[mcp_servers.node_repl]
+type = "stdio"
+command = 'C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node_repl.exe'
+startup_timeout_sec = 120
+
+[mcp_servers.node_repl.env]
+BROWSER_USE_CODEX_APP_BUILD_FLAVOR = "prod"
+NODE_REPL_NODE_PATH = 'C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node.exe'
+SKY_CUA_NATIVE_PIPE = "1"
+"#;
+    fs::write(cli_dir.join("config.toml"), desktop_runtime)
+        .expect("seed historical Desktop runtime contamination in CLI config");
+    fs::write(desktop_dir.join("config.toml"), desktop_runtime)
+        .expect("seed Desktop runtime config");
+
+    let mut config = MultiAppConfig::default();
+    let provider = Provider::with_id(
+        "codex-legacy-runtime-mcp".to_string(),
+        "Codex Legacy Runtime MCP".to_string(),
+        json!({
+            "auth": { "OPENAI_API_KEY": "codex-key" },
+            "config": "model = \"gpt-test\"\n"
+        }),
+        None,
+    );
+    let manager = config
+        .get_manager_mut(&AppType::Codex)
+        .expect("codex manager");
+    manager.current = provider.id.clone();
+    manager.providers.insert(provider.id.clone(), provider);
+
+    ConfigService::sync_current_providers_to_live(&mut config)
+        .expect("legacy CLI sync should remove the stale Desktop runtime MCP");
+
+    let cli_config =
+        fs::read_to_string(cli_dir.join("config.toml")).expect("read sanitized CLI config");
+    assert!(cli_config.contains("model = \"gpt-test\""));
+    assert!(
+        !cli_config.contains("node_repl"),
+        "isolated CLI config must not restore Desktop runtime MCP: {cli_config}"
+    );
+    assert_eq!(
+        fs::read_to_string(desktop_dir.join("config.toml"))
+            .expect("read unchanged Desktop runtime config"),
+        desktop_runtime,
+        "legacy CLI sync must not modify Desktop runtime configuration"
+    );
+}
+
+#[test]
+fn legacy_codex_provider_sync_merges_mcp_in_shared_directory() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let shared_dir = ensure_test_home().join("codex-shared-legacy");
+    update_settings(AppSettings {
+        codex_config_dir: Some(shared_dir.to_string_lossy().into_owned()),
+        codex_desktop_config_dir: Some(shared_dir.to_string_lossy().into_owned()),
+        ..Default::default()
+    })
+    .expect("set shared Codex directory");
+    fs::create_dir_all(&shared_dir).expect("create shared Codex directory");
+    let config_path = shared_dir.join("config.toml");
+    let original = r#"model = "desktop-before"
+
+[mcp_servers.node_repl]
+type = "stdio"
+command = "desktop-node-repl"
+startup_timeout_sec = 120
+
+[mcp_servers.node_repl.env]
+BROWSER_USE_CODEX_APP_BUILD_FLAVOR = "prod"
+SKY_CUA_NATIVE_PIPE = "1"
+
+[mcp_servers.external_runtime]
+type = "stdio"
+command = "external-command"
+args = ["--keep"]
+"#;
+    fs::write(&config_path, original).expect("seed Desktop runtime MCP");
+    let original_toml: toml::Value = toml::from_str(original).expect("parse original config");
+    let original_servers = original_toml["mcp_servers"]
+        .as_table()
+        .expect("original MCP table");
+    let original_node_repl = original_servers["node_repl"].clone();
+    let original_external = original_servers["external_runtime"].clone();
+
+    let mut config = MultiAppConfig::default();
+    let provider = Provider::with_id(
+        "codex-legacy".to_string(),
+        "Codex Legacy".to_string(),
+        json!({
+            "auth": { "OPENAI_API_KEY": "codex-key" },
+            "config": "model = \"gpt-test\"\n"
+        }),
+        None,
+    );
+    let manager = config
+        .get_manager_mut(&AppType::Codex)
+        .expect("codex manager");
+    manager.current = provider.id.clone();
+    manager.providers.insert(provider.id.clone(), provider);
+
+    ConfigService::sync_current_providers_to_live(&mut config)
+        .expect("legacy CLI sync must merge the shared runtime MCP");
+    let written = fs::read_to_string(&config_path).expect("read merged config");
+    let written_toml: toml::Value = toml::from_str(&written).expect("parse merged config");
+    assert_eq!(written_toml["model"].as_str(), Some("gpt-test"));
+    let written_servers = written_toml["mcp_servers"]
+        .as_table()
+        .expect("merged MCP table");
+    assert_eq!(written_servers["node_repl"], original_node_repl);
+    assert_eq!(written_servers["external_runtime"], original_external);
+
+    let stored_provider = config
+        .get_manager(&AppType::Codex)
+        .expect("codex manager")
+        .providers
+        .get("codex-legacy")
+        .expect("stored provider");
+    let stored_config = stored_provider
+        .settings_config
+        .get("config")
+        .and_then(serde_json::Value::as_str)
+        .expect("stored provider config");
+    assert_eq!(
+        stored_config, "model = \"gpt-test\"\n",
+        "live-only Desktop and external MCP must not backfill into the CLI provider"
+    );
+}
+
+#[test]
+fn legacy_codex_provider_sync_allows_shared_directory_without_mcp() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let shared_dir = ensure_test_home().join("codex-shared-legacy-empty");
+    update_settings(AppSettings {
+        codex_config_dir: Some(shared_dir.to_string_lossy().into_owned()),
+        codex_desktop_config_dir: Some(shared_dir.to_string_lossy().into_owned()),
+        ..Default::default()
+    })
+    .expect("set shared Codex directory");
+    fs::create_dir_all(&shared_dir).expect("create shared Codex directory");
+    let config_path = shared_dir.join("config.toml");
+    fs::write(&config_path, "model = \"old\"\n").expect("seed MCP-free config");
+
+    let mut config = MultiAppConfig::default();
+    let provider = Provider::with_id(
+        "codex-legacy".to_string(),
+        "Codex Legacy".to_string(),
+        json!({
+            "auth": { "OPENAI_API_KEY": "codex-key" },
+            "config": "model = \"gpt-test\"\n"
+        }),
+        None,
+    );
+    let manager = config
+        .get_manager_mut(&AppType::Codex)
+        .expect("codex manager");
+    manager.current = provider.id.clone();
+    manager.providers.insert(provider.id.clone(), provider);
+
+    ConfigService::sync_current_providers_to_live(&mut config)
+        .expect("shared MCP-free legacy flow should remain allowed");
+    let written = fs::read_to_string(&config_path).expect("read rewritten config");
+    assert!(written.contains("gpt-test"), "unexpected config: {written}");
+}
+
+#[test]
 fn global_sync_writes_current_codex_desktop_provider_to_its_own_directory() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();
@@ -502,6 +757,52 @@ mode = "dev"
     assert!(
         text.contains("echo") && text.contains("command = \"echo\""),
         "echo server should be serialized"
+    );
+}
+
+#[test]
+fn sync_enabled_to_codex_does_not_overwrite_shared_desktop_node_repl() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let shared_dir = ensure_test_home().join("codex-shared-legacy-mcp");
+    update_settings(AppSettings {
+        codex_config_dir: Some(shared_dir.to_string_lossy().into_owned()),
+        codex_desktop_config_dir: Some(shared_dir.to_string_lossy().into_owned()),
+        ..Default::default()
+    })
+    .expect("set shared Codex directory");
+    fs::create_dir_all(&shared_dir).expect("create shared Codex directory");
+
+    let path = shared_dir.join("config.toml");
+    let desktop_runtime = r#"[mcp_servers.node_repl]
+type = "stdio"
+command = 'C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node_repl.exe'
+
+[mcp_servers.node_repl.env]
+BROWSER_USE_CODEX_APP_BUILD_FLAVOR = "prod"
+NODE_REPL_NODE_PATH = 'C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node.exe'
+SKY_CUA_NATIVE_PIPE = "1"
+"#;
+    fs::write(&path, desktop_runtime).expect("seed Desktop runtime MCP");
+
+    let mut config = MultiAppConfig::default();
+    config.mcp.codex.servers.insert(
+        "node_repl".into(),
+        json!({
+            "id": "node_repl",
+            "enabled": true,
+            "server": { "type": "stdio", "command": "legacy-cli-node-repl" }
+        }),
+    );
+
+    cc_switch_lib::sync_enabled_to_codex(&config).expect("sync legacy Codex MCP");
+
+    let text = fs::read_to_string(&path).expect("read shared config.toml");
+    let parsed: toml::Value = toml::from_str(&text).expect("parse shared config.toml");
+    assert_eq!(
+        parsed["mcp_servers"]["node_repl"]["command"].as_str(),
+        Some("C:\\Users\\tester\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\hash\\bin\\node_repl.exe"),
+        "legacy CLI projection must not overwrite Desktop's runtime node_repl"
     );
 }
 

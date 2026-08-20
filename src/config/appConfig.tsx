@@ -86,7 +86,7 @@ export function isAdditiveAppId(appId: string): appId is AdditiveAppId {
   return (ADDITIVE_APP_IDS as string[]).includes(appId);
 }
 
-/** Desktop variants share their CLI app's MCP registry. */
+/** Desktop variants keep runtime-managed MCP outside the shared registry. */
 export type McpAppId = Exclude<
   AppId,
   "claude-desktop" | "codex-desktop" | "openclaw" | "pi"

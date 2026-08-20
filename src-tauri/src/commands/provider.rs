@@ -173,6 +173,13 @@ fn import_default_config_internal(state: &AppState, app_type: AppType) -> Result
         }
     }
 
+    // Manual Codex import must snapshot the CLI MCP projection first.  The
+    // provider snapshot intentionally strips [mcp_servers], so importing it
+    // afterwards would otherwise lose legitimate CLI MCP definitions.
+    if matches!(app_type, AppType::Codex) {
+        crate::services::McpService::import_from_codex(state)?;
+    }
+
     let imported = ProviderService::import_default_config(state, app_type.clone())?;
 
     if imported {

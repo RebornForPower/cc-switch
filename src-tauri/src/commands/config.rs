@@ -309,6 +309,11 @@ pub async fn get_common_config_snippet(
     app_type: String,
     state: tauri::State<'_, crate::store::AppState>,
 ) -> Result<Option<String>, String> {
+    if app_type == "codex-desktop" {
+        // Codex Desktop manages its common/runtime configuration itself; it
+        // must not read the CLI snippet namespace.
+        return Ok(None);
+    }
     state
         .db
         .get_config_snippet(&app_type)
@@ -338,6 +343,20 @@ pub async fn set_common_config_snippet(
     snippet: String,
     state: tauri::State<'_, crate::store::AppState>,
 ) -> Result<(), String> {
+    if app_type == "codex-desktop" {
+        // Keep the Desktop target out of the CLI common-config store.
+        return Ok(());
+    }
+
+    // Codex MCP is projected from the database and must never be persisted in
+    // the shared CLI snippet.  This also heals snippets created by older
+    // versions that accidentally captured Desktop's runtime MCP table.
+    let snippet = if app_type == "codex" {
+        codex_config::sanitize_codex_common_config_snippet(&snippet)
+            .map_err(|error| error.to_string())?
+    } else {
+        snippet
+    };
     let is_cleared = snippet.trim().is_empty();
     let old_snippet = state
         .db

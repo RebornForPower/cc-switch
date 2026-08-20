@@ -403,6 +403,697 @@ command = "echo"
 }
 
 #[test]
+fn import_codex_clears_known_desktop_runtime_node_repl_cli_flag() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let cli_dir = home.join("codex-cli");
+    let desktop_dir = home.join("codex-desktop");
+    update_settings(AppSettings {
+        codex_config_dir: Some(cli_dir.to_string_lossy().into_owned()),
+        codex_desktop_config_dir: Some(desktop_dir.to_string_lossy().into_owned()),
+        ..AppSettings::default()
+    })
+    .expect("set isolated Codex directories");
+    fs::create_dir_all(&cli_dir).expect("create CLI config directory");
+    fs::create_dir_all(&desktop_dir).expect("create Desktop config directory");
+    fs::write(cli_dir.join("config.toml"), "").expect("seed empty CLI config");
+    fs::write(
+        desktop_dir.join("config.toml"),
+        r#"[mcp_servers.node_repl]
+type = "stdio"
+command = 'C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node_repl.exe'
+
+[mcp_servers.node_repl.env]
+BROWSER_USE_CODEX_APP_BUILD_FLAVOR = "prod"
+NODE_REPL_NODE_PATH = 'C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node.exe'
+SKY_CUA_NATIVE_PIPE = "1"
+"#,
+    )
+    .expect("seed Desktop runtime MCP");
+
+    let state = create_test_state().expect("create test state");
+    state
+        .db
+        .save_mcp_server(&McpServer {
+            id: "node_repl".to_string(),
+            name: "node_repl".to_string(),
+            server: json!({
+                "type": "stdio",
+                "command": r"C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node_repl.exe",
+                "env": {
+                    "BROWSER_USE_CODEX_APP_BUILD_FLAVOR": "prod",
+                    "NODE_REPL_NODE_PATH": r"C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node.exe",
+                    "SKY_CUA_NATIVE_PIPE": "1"
+                }
+            }),
+            apps: McpApps {
+                codex: true,
+                ..McpApps::default()
+            },
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        })
+        .expect("seed stale CLI MCP state");
+
+    McpService::import_from_codex(&state).expect("import isolated CLI config");
+
+    let servers = state.db.get_all_mcp_servers().expect("read MCP servers");
+    let stored = servers.get("node_repl").expect("stale record remains");
+    assert!(
+        !stored.apps.codex,
+        "Desktop-only MCP must not remain enabled for Codex CLI"
+    );
+    assert_eq!(
+        stored.server,
+        json!({
+            "type": "stdio",
+            "command": r"C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node_repl.exe",
+            "env": {
+                "BROWSER_USE_CODEX_APP_BUILD_FLAVOR": "prod",
+                "NODE_REPL_NODE_PATH": r"C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node.exe",
+                "SKY_CUA_NATIVE_PIPE": "1"
+            }
+        }),
+        "stale correction must preserve the server definition"
+    );
+}
+
+#[test]
+fn import_codex_does_not_clear_unrecognized_desktop_only_cli_mcp_flag() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let cli_dir = home.join("codex-cli-preserve-db-ssot");
+    let desktop_dir = home.join("codex-desktop-preserve-db-ssot");
+    update_settings(AppSettings {
+        codex_config_dir: Some(cli_dir.to_string_lossy().into_owned()),
+        codex_desktop_config_dir: Some(desktop_dir.to_string_lossy().into_owned()),
+        ..AppSettings::default()
+    })
+    .expect("set isolated Codex directories");
+    fs::create_dir_all(&cli_dir).expect("create CLI config directory");
+    fs::create_dir_all(&desktop_dir).expect("create Desktop config directory");
+    fs::write(cli_dir.join("config.toml"), "").expect("seed empty CLI config");
+    fs::write(
+        desktop_dir.join("config.toml"),
+        "[mcp_servers.user_node_repl]\ncommand = \"node_repl\"\n",
+    )
+    .expect("seed unrelated Desktop MCP");
+
+    let state = create_test_state().expect("create test state");
+    state
+        .db
+        .save_mcp_server(&McpServer {
+            id: "user_node_repl".to_string(),
+            name: "User Node REPL".to_string(),
+            server: json!({ "type": "stdio", "command": "node_repl" }),
+            apps: McpApps {
+                codex: true,
+                ..McpApps::default()
+            },
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        })
+        .expect("seed legitimate CLI MCP state");
+
+    McpService::import_from_codex(&state).expect("import isolated CLI config");
+
+    let servers = state.db.get_all_mcp_servers().expect("read MCP servers");
+    assert!(
+        servers
+            .get("user_node_repl")
+            .expect("CLI record remains")
+            .apps
+            .codex,
+        "live-file differences must not override the database CLI flag"
+    );
+}
+
+#[test]
+fn codex_mcp_toggle_in_shared_directory_preserves_desktop_and_external_mcp() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let shared_dir = home.join("codex-shared");
+    update_settings(AppSettings {
+        codex_config_dir: Some(shared_dir.to_string_lossy().into_owned()),
+        codex_desktop_config_dir: Some(shared_dir.to_string_lossy().into_owned()),
+        ..AppSettings::default()
+    })
+    .expect("set shared Codex directories");
+    fs::create_dir_all(&shared_dir).expect("create shared Codex directory");
+    let config_path = shared_dir.join("config.toml");
+    let shared_live = r#"model = "desktop-model"
+
+[mcp_servers.node_repl]
+type = "stdio"
+command = "desktop-node-repl.exe"
+startup_timeout_sec = 120
+
+[mcp_servers.node_repl.env]
+BROWSER_USE_CODEX_APP_BUILD_FLAVOR = "prod"
+SKY_CUA_NATIVE_PIPE = "1"
+
+[mcp_servers.external_runtime]
+type = "stdio"
+command = "external-command"
+args = ["--keep", "verbatim"]
+"#;
+    fs::write(&config_path, shared_live).expect("seed shared Desktop and external MCP");
+    let original: toml::Value = toml::from_str(shared_live).expect("parse original shared config");
+    let original_servers = original["mcp_servers"]
+        .as_table()
+        .expect("original MCP table");
+    let original_node_repl = original_servers["node_repl"].clone();
+    let original_external = original_servers["external_runtime"].clone();
+
+    let state = create_test_state().expect("create test state");
+    state
+        .db
+        .save_mcp_server(&McpServer {
+            id: "shared-server".to_string(),
+            name: "Shared Server".to_string(),
+            server: json!({ "type": "stdio", "command": "echo" }),
+            apps: McpApps::default(),
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        })
+        .expect("seed MCP server");
+
+    McpService::toggle_app(&state, "shared-server", AppType::Codex, true)
+        .expect("enabling a CLI MCP must merge into the shared config");
+    let servers = state.db.get_all_mcp_servers().expect("read MCP servers");
+    let stored = servers.get("shared-server").expect("server remains");
+    assert!(
+        stored.apps.codex,
+        "enabled_codex must represent the CLI toggle"
+    );
+
+    let enabled: toml::Value =
+        toml::from_str(&fs::read_to_string(&config_path).expect("read shared config after enable"))
+            .expect("parse shared config after enable");
+    let enabled_servers = enabled["mcp_servers"]
+        .as_table()
+        .expect("enabled MCP table");
+    assert_eq!(enabled_servers["node_repl"], original_node_repl);
+    assert_eq!(enabled_servers["external_runtime"], original_external);
+    assert_eq!(
+        enabled_servers["shared-server"]["command"].as_str(),
+        Some("echo")
+    );
+
+    McpService::toggle_app(&state, "shared-server", AppType::Codex, false)
+        .expect("disabling a CLI MCP must remove only the CLI-owned entry");
+    let servers = state
+        .db
+        .get_all_mcp_servers()
+        .expect("read disabled MCP state");
+    assert!(
+        !servers["shared-server"].apps.codex,
+        "enabled_codex must be cleared for the CLI entry"
+    );
+
+    let disabled: toml::Value = toml::from_str(
+        &fs::read_to_string(&config_path).expect("read shared config after disable"),
+    )
+    .expect("parse shared config after disable");
+    let disabled_servers = disabled["mcp_servers"]
+        .as_table()
+        .expect("disabled MCP table");
+    assert_eq!(disabled_servers["node_repl"], original_node_repl);
+    assert_eq!(disabled_servers["external_runtime"], original_external);
+    assert!(
+        !disabled_servers.contains_key("shared-server"),
+        "a disabled CLI MCP must not be restored from the shared live file"
+    );
+}
+
+#[test]
+fn codex_mcp_rejects_desktop_runtime_node_repl_in_shared_directory() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let shared_dir = home.join("codex-shared-runtime-conflict");
+    update_settings(AppSettings {
+        codex_config_dir: Some(shared_dir.to_string_lossy().into_owned()),
+        codex_desktop_config_dir: Some(shared_dir.to_string_lossy().into_owned()),
+        ..AppSettings::default()
+    })
+    .expect("set shared Codex directories");
+    fs::create_dir_all(&shared_dir).expect("create shared Codex directory");
+    let config_path = shared_dir.join("config.toml");
+    let desktop_runtime = r#"[mcp_servers.node_repl]
+type = "stdio"
+command = 'C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node_repl.exe'
+
+[mcp_servers.node_repl.env]
+BROWSER_USE_CODEX_APP_BUILD_FLAVOR = "prod"
+NODE_REPL_NODE_PATH = 'C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node.exe'
+SKY_CUA_NATIVE_PIPE = "1"
+"#;
+    fs::write(&config_path, desktop_runtime).expect("seed Desktop runtime MCP");
+
+    let state = create_test_state().expect("create test state");
+    let cli_node_repl = McpServer {
+        id: "node_repl".to_string(),
+        name: "CLI node repl".to_string(),
+        server: json!({ "type": "stdio", "command": "echo" }),
+        apps: McpApps {
+            codex: true,
+            ..McpApps::default()
+        },
+        description: None,
+        homepage: None,
+        docs: None,
+        tags: Vec::new(),
+    };
+
+    let error = McpService::upsert_server(&state, cli_node_repl.clone())
+        .expect_err("a CLI MCP must not overwrite the Desktop runtime entry");
+    assert!(error.to_string().contains("Codex Desktop"));
+    assert!(
+        !state
+            .db
+            .get_all_mcp_servers()
+            .expect("read MCP rows")
+            .contains_key("node_repl"),
+        "the rejected upsert must not persist enabled_codex"
+    );
+
+    let mut disabled = cli_node_repl;
+    disabled.apps.codex = false;
+    state
+        .db
+        .save_mcp_server(&disabled)
+        .expect("seed disabled CLI row");
+    let error = McpService::toggle_app(&state, "node_repl", AppType::Codex, true)
+        .expect_err("a direct CLI toggle must not overwrite the Desktop runtime entry");
+    assert!(error.to_string().contains("Codex Desktop"));
+    assert!(
+        !state
+            .db
+            .get_all_mcp_servers()
+            .expect("read MCP rows after rejected toggle")["node_repl"]
+            .apps
+            .codex,
+        "the rejected toggle must leave enabled_codex disabled"
+    );
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("read unchanged Desktop runtime config"),
+        desktop_runtime
+    );
+}
+
+#[test]
+fn codex_live_rewrite_in_shared_directory_merges_mcp_by_ownership() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let shared_dir = home.join("codex-shared-live-mcp");
+    update_settings(AppSettings {
+        codex_config_dir: Some(shared_dir.to_string_lossy().into_owned()),
+        codex_desktop_config_dir: Some(shared_dir.to_string_lossy().into_owned()),
+        ..AppSettings::default()
+    })
+    .expect("set shared Codex directories");
+    fs::create_dir_all(&shared_dir).expect("create shared Codex directory");
+    let config_path = shared_dir.join("config.toml");
+    let shared_live = r#"model = "before"
+
+[mcp_servers.node_repl]
+type = "stdio"
+command = 'C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node_repl.exe'
+
+[mcp_servers.node_repl.env]
+BROWSER_USE_CODEX_APP_BUILD_FLAVOR = "prod"
+NODE_REPL_NODE_PATH = 'C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node.exe'
+SKY_CUA_NATIVE_PIPE = "1"
+
+[mcp_servers.external_runtime]
+type = "stdio"
+command = "external-command"
+args = ["--preserve"]
+
+[mcp_servers.disabled_cli]
+type = "stdio"
+command = "stale-disabled-command"
+
+[mcp_servers.enabled_cli]
+type = "stdio"
+command = "stale-enabled-command"
+"#;
+    fs::write(&config_path, shared_live).expect("seed shared MCP ownership fixture");
+    let original: toml::Value = toml::from_str(shared_live).expect("parse original shared config");
+    let original_servers = original["mcp_servers"]
+        .as_table()
+        .expect("original MCP table");
+    let original_node_repl = original_servers["node_repl"].clone();
+    let original_external = original_servers["external_runtime"].clone();
+
+    let state = create_test_state().expect("create test state");
+    for server in [
+        McpServer {
+            id: "node_repl".to_string(),
+            name: "node_repl".to_string(),
+            server: json!({
+                "type": "stdio",
+                "command": r"C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node_repl.exe",
+                "env": {
+                    "BROWSER_USE_CODEX_APP_BUILD_FLAVOR": "prod",
+                    "NODE_REPL_NODE_PATH": r"C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node.exe",
+                    "SKY_CUA_NATIVE_PIPE": "1"
+                }
+            }),
+            apps: McpApps {
+                codex: true,
+                ..McpApps::default()
+            },
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        },
+        McpServer {
+            id: "disabled_cli".to_string(),
+            name: "Disabled CLI".to_string(),
+            server: json!({ "type": "stdio", "command": "disabled-command" }),
+            apps: McpApps::default(),
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        },
+        McpServer {
+            id: "enabled_cli".to_string(),
+            name: "Enabled CLI".to_string(),
+            server: json!({ "type": "stdio", "command": "db-enabled-command" }),
+            apps: McpApps {
+                codex: true,
+                ..McpApps::default()
+            },
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        },
+    ] {
+        state
+            .db
+            .save_mcp_server(&server)
+            .expect("seed MCP ownership row");
+    }
+
+    let preflight = McpService::preflight_codex_live_rewrite(&state)
+        .expect("shared MCP must be captured for an ownership-aware rewrite");
+    assert!(
+        state
+            .db
+            .get_all_mcp_servers()
+            .expect("read preflight MCP state")["node_repl"]
+            .apps
+            .codex,
+        "historical Desktop cleanup must wait until the live rewrite commits"
+    );
+
+    fs::write(&config_path, "model = \"after\"\n").expect("replace provider config");
+    McpService::sync_codex_after_live_rewrite(&state, preflight)
+        .expect("merge preserved and CLI-owned MCP after the rewrite");
+
+    let rewritten: toml::Value =
+        toml::from_str(&fs::read_to_string(&config_path).expect("read rewritten shared config"))
+            .expect("parse rewritten shared config");
+    assert_eq!(rewritten["model"].as_str(), Some("after"));
+    let rewritten_servers = rewritten["mcp_servers"]
+        .as_table()
+        .expect("rewritten MCP table");
+    assert_eq!(rewritten_servers["node_repl"], original_node_repl);
+    assert_eq!(rewritten_servers["external_runtime"], original_external);
+    assert_eq!(
+        rewritten_servers["enabled_cli"]["command"].as_str(),
+        Some("db-enabled-command"),
+        "the database CLI definition must replace stale live content"
+    );
+    assert!(
+        !rewritten_servers.contains_key("disabled_cli"),
+        "a database-known disabled CLI MCP must not be restored"
+    );
+
+    let servers = state
+        .db
+        .get_all_mcp_servers()
+        .expect("read finalized MCP state");
+    assert!(servers["enabled_cli"].apps.codex);
+    assert!(!servers["disabled_cli"].apps.codex);
+    assert!(
+        !servers["node_repl"].apps.codex,
+        "enabled_codex must describe CLI ownership, not Desktop runtime ownership"
+    );
+}
+
+#[test]
+fn codex_live_rewrite_preflight_allows_empty_shared_mcp_state() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let shared_dir = home.join("codex-shared-empty-mcp");
+    update_settings(AppSettings {
+        codex_config_dir: Some(shared_dir.to_string_lossy().into_owned()),
+        codex_desktop_config_dir: Some(shared_dir.to_string_lossy().into_owned()),
+        ..AppSettings::default()
+    })
+    .expect("set shared Codex directories");
+    fs::create_dir_all(&shared_dir).expect("create shared Codex directory");
+    fs::write(shared_dir.join("config.toml"), "").expect("seed shared config without MCP");
+
+    let state = create_test_state().expect("create test state");
+    let preflight = McpService::preflight_codex_live_rewrite(&state)
+        .expect("empty shared MCP state remains compatible with legacy CLI writes");
+    let rewritten = "model = \"gpt-5\"\n";
+    fs::write(shared_dir.join("config.toml"), rewritten).expect("rewrite shared CLI config");
+
+    McpService::sync_codex_after_live_rewrite(&state, preflight)
+        .expect("empty Codex MCP projection should remain a no-op");
+    assert_eq!(
+        fs::read_to_string(shared_dir.join("config.toml")).expect("read shared config"),
+        rewritten,
+        "post-write MCP sync must leave an unmanaged shared config untouched"
+    );
+}
+
+#[test]
+fn codex_live_rewrite_uses_prewrite_cli_mcp_ownership_snapshot() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let cli_dir = home.join("codex-cli-preflight");
+    let desktop_dir = home.join("codex-desktop-preflight");
+    update_settings(AppSettings {
+        codex_config_dir: Some(cli_dir.to_string_lossy().into_owned()),
+        codex_desktop_config_dir: Some(desktop_dir.to_string_lossy().into_owned()),
+        ..AppSettings::default()
+    })
+    .expect("set isolated Codex directories");
+    fs::create_dir_all(&cli_dir).expect("create CLI config directory");
+    fs::create_dir_all(&desktop_dir).expect("create Desktop config directory");
+    fs::write(
+        cli_dir.join("config.toml"),
+        "[mcp_servers.cli_owned]\ncommand = \"cli-command\"\n",
+    )
+    .expect("seed CLI-owned MCP");
+    fs::write(
+        desktop_dir.join("config.toml"),
+        r#"[mcp_servers.node_repl]
+type = "stdio"
+command = 'C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node_repl.exe'
+
+[mcp_servers.node_repl.env]
+BROWSER_USE_CODEX_APP_BUILD_FLAVOR = "prod"
+NODE_REPL_NODE_PATH = 'C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node.exe'
+SKY_CUA_NATIVE_PIPE = "1"
+"#,
+    )
+    .expect("seed Desktop runtime MCP");
+
+    let state = create_test_state().expect("create test state");
+    for (id, server) in [
+        (
+            "cli_owned",
+            json!({ "type": "stdio", "command": "cli-command" }),
+        ),
+        (
+            "node_repl",
+            json!({
+                "type": "stdio",
+                "command": r"C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node_repl.exe",
+                "env": {
+                    "BROWSER_USE_CODEX_APP_BUILD_FLAVOR": "prod",
+                    "NODE_REPL_NODE_PATH": r"C:\Users\tester\AppData\Local\OpenAI\Codex\runtimes\cua_node\hash\bin\node.exe",
+                    "SKY_CUA_NATIVE_PIPE": "1"
+                }
+            }),
+        ),
+    ] {
+        state
+            .db
+            .save_mcp_server(&McpServer {
+                id: id.to_string(),
+                name: id.to_string(),
+                server,
+                apps: McpApps {
+                    codex: true,
+                    ..McpApps::default()
+                },
+                description: None,
+                homepage: None,
+                docs: None,
+                tags: Vec::new(),
+            })
+            .expect("seed MCP server");
+    }
+
+    let preflight = McpService::preflight_codex_live_rewrite_with_db(state.db.as_ref())
+        .expect("capture isolated Codex MCP ownership");
+    let servers = state
+        .db
+        .get_all_mcp_servers()
+        .expect("read corrected MCP state");
+    assert!(servers["cli_owned"].apps.codex);
+    assert!(
+        servers["node_repl"].apps.codex,
+        "preflight must defer Desktop-only stale CLI cleanup until the write succeeds"
+    );
+
+    fs::write(cli_dir.join("config.toml"), "model = \"new-provider\"\n")
+        .expect("replace CLI provider config");
+    McpService::sync_codex_after_live_rewrite_with_db(state.db.as_ref(), preflight)
+        .expect("restore CLI MCP from the pre-write snapshot");
+
+    let servers = state
+        .db
+        .get_all_mcp_servers()
+        .expect("read finalized MCP state");
+    assert!(!servers["node_repl"].apps.codex);
+
+    let rewritten = fs::read_to_string(cli_dir.join("config.toml")).expect("read CLI config");
+    assert!(rewritten.contains("model = \"new-provider\""));
+    assert!(rewritten.contains("[mcp_servers.cli_owned]"));
+    assert!(
+        !rewritten.contains("node_repl"),
+        "post-write sync must not reclassify Desktop MCP from rewritten CLI live state"
+    );
+}
+
+#[test]
+fn sync_all_enabled_merges_codex_cli_mcp_into_shared_directory() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let shared_dir = home.join("codex-shared-sync-all");
+    update_settings(AppSettings {
+        codex_config_dir: Some(shared_dir.to_string_lossy().into_owned()),
+        codex_desktop_config_dir: Some(shared_dir.to_string_lossy().into_owned()),
+        ..AppSettings::default()
+    })
+    .expect("set shared Codex directories");
+    fs::create_dir_all(&shared_dir).expect("create shared Codex directory");
+    let shared_live = r#"[mcp_servers.node_repl]
+command = "desktop-node-repl"
+
+[mcp_servers.runtime_owned]
+command = "runtime"
+args = ["--keep"]
+"#;
+    fs::write(shared_dir.join("config.toml"), shared_live).expect("seed shared Codex MCP");
+    let claude_mcp_path = get_claude_mcp_path();
+    if let Some(parent) = claude_mcp_path.parent() {
+        fs::create_dir_all(parent).expect("create Claude config directory");
+    }
+    fs::write(&claude_mcp_path, "{}").expect("seed installed Claude MCP config");
+
+    let state = create_test_state().expect("create test state");
+    state
+        .db
+        .save_mcp_server(&McpServer {
+            id: "claude-enabled".to_string(),
+            name: "Claude Enabled".to_string(),
+            server: json!({ "type": "stdio", "command": "claude-command" }),
+            apps: McpApps {
+                claude: true,
+                ..McpApps::default()
+            },
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        })
+        .expect("seed Claude MCP");
+    state
+        .db
+        .save_mcp_server(&McpServer {
+            id: "cli-enabled".to_string(),
+            name: "CLI Enabled".to_string(),
+            server: json!({ "type": "stdio", "command": "cli-command" }),
+            apps: McpApps {
+                codex: true,
+                ..McpApps::default()
+            },
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        })
+        .expect("seed Codex CLI MCP");
+
+    McpService::sync_all_enabled(&state)
+        .expect("all-app sync must merge Codex CLI MCP in a shared directory");
+
+    let claude: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&claude_mcp_path).expect("read Claude MCP config"),
+    )
+    .expect("parse Claude MCP config");
+    assert_eq!(
+        claude["mcpServers"]["claude-enabled"]["command"],
+        json!("claude-command"),
+        "Codex merging must not block Claude MCP projection"
+    );
+    let codex: toml::Value = toml::from_str(
+        &fs::read_to_string(shared_dir.join("config.toml")).expect("read shared Codex config"),
+    )
+    .expect("parse shared Codex config");
+    let codex_servers = codex["mcp_servers"]
+        .as_table()
+        .expect("shared Codex MCP table");
+    assert_eq!(
+        codex_servers["node_repl"]["command"].as_str(),
+        Some("desktop-node-repl")
+    );
+    assert_eq!(
+        codex_servers["runtime_owned"]["command"].as_str(),
+        Some("runtime")
+    );
+    assert_eq!(
+        codex_servers["runtime_owned"]["args"]
+            .as_array()
+            .expect("external args")
+            .len(),
+        1,
+        "unknown external MCP fields must be preserved"
+    );
+    assert_eq!(
+        codex_servers["cli-enabled"]["command"].as_str(),
+        Some("cli-command"),
+        "enabled_codex entries must be projected as CLI MCP"
+    );
+}
+
+#[test]
 fn import_mcp_from_claude_does_not_sync_existing_codex_enabled_server() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();

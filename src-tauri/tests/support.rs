@@ -29,6 +29,7 @@ pub fn reset_test_fs() {
     for sub in [
         ".claude",
         ".codex",
+        ".codex-desktop-test",
         ".cc-switch",
         ".gemini",
         ".grok",
@@ -48,14 +49,22 @@ pub fn reset_test_fs() {
         let _ = std::fs::remove_file(&claude_json);
     }
 
-    // 重置内存中的设置缓存，确保测试环境不受上一次调用影响
-    let _ = update_settings(AppSettings::default());
+    // Keep the test targets isolated.  Production intentionally reports the
+    // historical fallback (`~/.codex`) as a CLI/Desktop conflict, while most
+    // MCP/provider integration tests need a writable CLI projection.
+    let desktop_dir = home.join(".codex-desktop-test");
+    let _ = update_settings(AppSettings {
+        codex_desktop_config_dir: Some(desktop_dir.to_string_lossy().into_owned()),
+        ..AppSettings::default()
+    });
 }
 
 #[allow(dead_code)]
 pub fn enable_codex_official_auth_preservation() {
+    let desktop_dir = ensure_test_home().join(".codex-desktop-test");
     update_settings(AppSettings {
         preserve_codex_official_auth_on_switch: true,
+        codex_desktop_config_dir: Some(desktop_dir.to_string_lossy().into_owned()),
         ..Default::default()
     })
     .expect("enable Codex official auth preservation");

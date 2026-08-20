@@ -4124,11 +4124,45 @@ impl ProviderService {
         preflighted_provider: Option<&Provider>,
     ) -> Result<(), AppError> {
         if let Some(effective_provider) = preflighted_provider {
-            if matches!(app_type, AppType::CodexDesktop) {
-                crate::codex_desktop_config::apply_provider(state.db.as_ref(), effective_provider)
+            let codex_live_snapshot = if matches!(app_type, AppType::Codex) {
+                Some(crate::codex_config::CodexLiveStateSnapshot::capture()?)
             } else {
-                live::write_live_snapshot(app_type, effective_provider)
+                None
+            };
+            let codex_mcp_preflight = if matches!(app_type, AppType::Codex) {
+                Some(McpService::preflight_codex_live_rewrite(state)?)
+            } else {
+                None
+            };
+
+            let write_result = (|| {
+                if matches!(app_type, AppType::CodexDesktop) {
+                    crate::codex_desktop_config::apply_provider(
+                        state.db.as_ref(),
+                        effective_provider,
+                    )
+                } else {
+                    live::write_live_snapshot(app_type, effective_provider)
+                }?;
+
+                if let Some(preflight) = codex_mcp_preflight {
+                    McpService::sync_codex_after_live_rewrite(state, preflight)?;
+                }
+                Ok::<(), AppError>(())
+            })();
+
+            if let Err(error) = write_result {
+                if let Some(snapshot) = codex_live_snapshot.as_ref() {
+                    return match snapshot.restore_preserving_newer_same_account_auth() {
+                        Ok(()) => Err(error),
+                        Err(rollback_error) => Err(AppError::Message(format!(
+                            "写入 Codex Live 配置失败: {error}; 回滚失败: {rollback_error}"
+                        ))),
+                    };
+                }
+                return Err(error);
             }
+            Ok(())
         } else {
             write_live_with_common_config_for_state(state, app_type, provider)
         }
@@ -4427,7 +4461,26 @@ impl ProviderService {
         if app_type == AppType::Pi {
             return pi::list(state);
         }
-        state.db.get_all_providers(app_type.as_str())
+        let mut providers = state.db.get_all_providers(app_type.as_str())?;
+
+        // Older builds could persist a live Codex MCP projection in a CLI
+        // provider row. Keep the database unchanged during this read, but do
+        // not hand that runtime-owned table to the editor where a later save
+        // would reintroduce it.
+        if app_type == AppType::Codex {
+            for provider in providers.values_mut() {
+                if let Err(error) = crate::codex_config::strip_codex_mcp_servers_from_settings(
+                    &mut provider.settings_config,
+                ) {
+                    log::warn!(
+                        "读取 Codex 供应商 '{}' 时无法清理历史 MCP 配置: {error}",
+                        provider.id
+                    );
+                }
+            }
+        }
+
+        Ok(providers)
     }
 
     /// Get current provider ID
@@ -4478,6 +4531,15 @@ impl ProviderService {
         } else {
             None
         };
+
+        // A first Codex CLI provider becomes current and rewrites config.toml.
+        // Parse MCP ownership before either the provider row or current state
+        // is changed; shared runtime entries are merged after the write.
+        if matches!(app_type, AppType::Codex)
+            && crate::settings::get_effective_current_provider(&state.db, &app_type)?.is_none()
+        {
+            let _ = McpService::preflight_codex_live_rewrite(state)?;
+        }
 
         if needs_codex_add_transaction {
             let effective_current =
@@ -4745,6 +4807,13 @@ impl ProviderService {
         let effective_current =
             crate::settings::get_effective_current_provider(&state.db, &app_type)?;
         let is_current = effective_current.as_deref() == Some(provider.id.as_str());
+
+        // Non-current Codex edits are DB-only. Current edits can rewrite Live,
+        // so parse MCP ownership before any provider mutation; shared runtime
+        // entries are restored after the write.
+        if matches!(app_type, AppType::Codex) && is_current {
+            let _ = McpService::preflight_codex_live_rewrite(state)?;
+        }
 
         let existing_managed_codex_account_id = existing_provider
             .as_ref()
@@ -5276,6 +5345,13 @@ impl ProviderService {
             .get(id)
             .ok_or_else(|| AppError::Message(format!("供应商 {id} 不存在")))?;
 
+        // Switching can backfill the outgoing provider and change both local
+        // and database current state before the final Live write. Parse MCP
+        // ownership first so malformed live TOML fails atomically.
+        if matches!(app_type, AppType::Codex) {
+            let _ = McpService::preflight_codex_live_rewrite(state)?;
+        }
+
         if matches!(app_type, AppType::CodexDesktop) {
             crate::codex_config::ensure_codex_target_isolated(
                 crate::codex_config::CodexTarget::Desktop,
@@ -5768,6 +5844,10 @@ impl ProviderService {
         state: &AppState,
         app_type: AppType,
     ) -> Result<String, AppError> {
+        if matches!(app_type, AppType::CodexDesktop) {
+            return Ok(String::new());
+        }
+
         // Get current provider
         let current_id = Self::current(state, app_type.clone())?;
         if current_id.is_empty() {
@@ -5781,10 +5861,8 @@ impl ProviderService {
 
         match app_type {
             AppType::Claude => Self::extract_claude_common_config(&provider.settings_config),
-            AppType::ClaudeDesktop => Ok(String::new()),
-            AppType::Codex | AppType::CodexDesktop => {
-                Self::extract_codex_common_config(&provider.settings_config)
-            }
+            AppType::ClaudeDesktop | AppType::CodexDesktop => Ok(String::new()),
+            AppType::Codex => Self::extract_codex_common_config(&provider.settings_config),
             AppType::Gemini => Self::extract_gemini_common_config(&provider.settings_config),
             AppType::GrokBuild => Ok(String::new()),
             AppType::OpenCode => Self::extract_opencode_common_config(&provider.settings_config),
@@ -5801,10 +5879,8 @@ impl ProviderService {
     ) -> Result<String, AppError> {
         match app_type {
             AppType::Claude => Self::extract_claude_common_config(settings_config),
-            AppType::ClaudeDesktop => Ok(String::new()),
-            AppType::Codex | AppType::CodexDesktop => {
-                Self::extract_codex_common_config(settings_config)
-            }
+            AppType::ClaudeDesktop | AppType::CodexDesktop => Ok(String::new()),
+            AppType::Codex => Self::extract_codex_common_config(settings_config),
             AppType::Gemini => Self::extract_gemini_common_config(settings_config),
             AppType::GrokBuild => Ok(String::new()),
             AppType::OpenCode => Self::extract_opencode_common_config(settings_config),
