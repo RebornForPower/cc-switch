@@ -315,10 +315,6 @@ function ProviderFormFull({
   const { t } = useTranslation();
   const isEditMode = Boolean(initialData);
   const isCodex = isCodexAppId(appId);
-  // Codex Desktop's runtime owns its common configuration.  The shared
-  // snippet editor is a CLI-only feature and must not be applied to Desktop
-  // provider drafts.
-  const isCodexCli = appId === "codex";
   const initialCodexOfficialIdentity =
     isCodex && initialData
       ? resolveCodexOfficialIdentity(appId, {
@@ -907,14 +903,15 @@ function ProviderFormFull({
     handleExtract: handleCodexExtract,
     clearCommonConfigError: clearCodexCommonConfigError,
   } = useCodexCommonConfig({
+    appType: appId === "codex-desktop" ? "codex-desktop" : "codex",
     codexConfig,
     onConfigChange: handleCodexConfigChange,
-    initialData: isCodexCli ? initialData : undefined,
-    initialEnabled: isCodexCli
+    initialData: isCodex ? initialData : undefined,
+    initialEnabled: isCodex
       ? initialData?.meta?.commonConfigEnabled
       : undefined,
     selectedPresetId: selectedPresetId ?? undefined,
-    enabled: isCodexCli,
+    enabled: isCodex,
   });
 
   const {
@@ -1767,7 +1764,7 @@ function ProviderFormFull({
       commonConfigEnabled:
         appId === "claude"
           ? useCommonConfig
-          : isCodexCli
+          : isCodex
             ? useCodexCommonConfigFlag
             : appId === "gemini"
               ? useGeminiCommonConfigFlag
@@ -2744,7 +2741,6 @@ function ProviderFormFull({
                 configValue={codexConfig}
                 providerName={form.watch("name")}
                 showRemoteCompaction={category !== "official"}
-                showCommonConfig={isCodexCli}
                 isProxyTakeover={isProxyTakeover}
                 onAuthChange={setCodexAuth}
                 onConfigChange={handleCodexConfigChange}

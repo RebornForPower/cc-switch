@@ -309,11 +309,6 @@ pub async fn get_common_config_snippet(
     app_type: String,
     state: tauri::State<'_, crate::store::AppState>,
 ) -> Result<Option<String>, String> {
-    if app_type == "codex-desktop" {
-        // Codex Desktop manages its common/runtime configuration itself; it
-        // must not read the CLI snippet namespace.
-        return Ok(None);
-    }
     state
         .db
         .get_config_snippet(&app_type)
@@ -343,11 +338,6 @@ pub async fn set_common_config_snippet(
     snippet: String,
     state: tauri::State<'_, crate::store::AppState>,
 ) -> Result<(), String> {
-    if app_type == "codex-desktop" {
-        // Keep the Desktop target out of the CLI common-config store.
-        return Ok(());
-    }
-
     // Codex MCP is projected from the database and must never be persisted in
     // the shared CLI snippet.  This also heals snippets created by older
     // versions that accidentally captured Desktop's runtime MCP table.
@@ -367,7 +357,10 @@ pub async fn set_common_config_snippet(
 
     let value = if is_cleared { None } else { Some(snippet) };
 
-    if matches!(app_type.as_str(), "claude" | "codex" | "gemini") {
+    if matches!(
+        app_type.as_str(),
+        "claude" | "codex" | "codex-desktop" | "gemini"
+    ) {
         if let Some(legacy_snippet) = old_snippet
             .as_deref()
             .filter(|value| !value.trim().is_empty())
@@ -391,7 +384,10 @@ pub async fn set_common_config_snippet(
         .set_config_snippet_cleared(&app_type, is_cleared)
         .map_err(|e| e.to_string())?;
 
-    if matches!(app_type.as_str(), "claude" | "codex" | "gemini") {
+    if matches!(
+        app_type.as_str(),
+        "claude" | "codex" | "codex-desktop" | "gemini"
+    ) {
         let app = AppType::from_str(&app_type).map_err(|e| e.to_string())?;
         crate::services::provider::ProviderService::sync_current_provider_for_app(
             state.inner(),
@@ -443,6 +439,16 @@ mod tests {
     fn validate_common_config_snippet_rejects_invalid_codex_snippet() {
         let err = validate_common_config_snippet("codex", "[broken")
             .expect_err("invalid codex snippet should be rejected");
+        assert!(
+            err.contains("TOML") || err.contains("toml") || err.contains("格式"),
+            "expected TOML validation error, got {err}"
+        );
+    }
+
+    #[test]
+    fn validate_common_config_snippet_rejects_invalid_codex_desktop_snippet() {
+        let err = validate_common_config_snippet("codex-desktop", "[broken")
+            .expect_err("invalid Codex Desktop snippet should be rejected");
         assert!(
             err.contains("TOML") || err.contains("toml") || err.contains("格式"),
             "expected TOML validation error, got {err}"

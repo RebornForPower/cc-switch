@@ -99,7 +99,6 @@ interface CodexConfigSectionProps {
   onChange: (value: string) => void;
   providerName?: string;
   showRemoteCompaction?: boolean;
-  showCommonConfig?: boolean;
   useCommonConfig: boolean;
   onCommonConfigToggle: (checked: boolean) => void;
   onEditCommonConfig: () => void;
@@ -116,7 +115,6 @@ export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
   onChange,
   providerName,
   showRemoteCompaction = true,
-  showCommonConfig = true,
   useCommonConfig,
   onCommonConfigToggle,
   onEditCommonConfig,
@@ -272,38 +270,32 @@ export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
             </label>
           )}
 
-          {showCommonConfig && (
-            <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-muted-foreground">
-              <input
-                type="checkbox"
-                checked={useCommonConfig}
-                onChange={(e) => onCommonConfigToggle(e.target.checked)}
-                className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
-              />
-              {t("codexConfig.writeCommonConfig")}
-            </label>
-          )}
+          <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-muted-foreground">
+            <input
+              type="checkbox"
+              checked={useCommonConfig}
+              onChange={(e) => onCommonConfigToggle(e.target.checked)}
+              className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
+            />
+            {t("codexConfig.writeCommonConfig")}
+          </label>
         </div>
       </div>
 
-      {showCommonConfig && (
-        <>
-          <div className="flex items-center justify-end">
-            <button
-              type="button"
-              onClick={onEditCommonConfig}
-              className="text-xs text-blue-500 dark:text-blue-400 hover:underline"
-            >
-              {t("codexConfig.editCommonConfig")}
-            </button>
-          </div>
+      <div className="flex items-center justify-end">
+        <button
+          type="button"
+          onClick={onEditCommonConfig}
+          className="text-xs text-blue-500 dark:text-blue-400 hover:underline"
+        >
+          {t("codexConfig.editCommonConfig")}
+        </button>
+      </div>
 
-          {commonConfigError && (
-            <p className="text-xs text-red-500 dark:text-red-400 text-right">
-              {commonConfigError}
-            </p>
-          )}
-        </>
+      {commonConfigError && (
+        <p className="text-xs text-red-500 dark:text-red-400 text-right">
+          {commonConfigError}
+        </p>
       )}
 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1">

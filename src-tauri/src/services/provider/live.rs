@@ -495,7 +495,7 @@ fn settings_contain_common_config(app_type: &AppType, settings: &Value, snippet:
             Ok(source) if source.is_object() => json_is_subset(settings, &source),
             _ => false,
         },
-        AppType::Codex => {
+        AppType::Codex | AppType::CodexDesktop => {
             let config_toml = settings.get("config").and_then(Value::as_str).unwrap_or("");
             if config_toml.trim().is_empty() {
                 return false;
@@ -530,8 +530,7 @@ fn settings_contain_common_config(app_type: &AppType, settings: &Value, snippet:
         | AppType::OpenClaw
         | AppType::Hermes
         | AppType::Pi
-        | AppType::ClaudeDesktop
-        | AppType::CodexDesktop => false,
+        | AppType::ClaudeDesktop => false,
     }
 }
 
@@ -540,10 +539,6 @@ pub(crate) fn provider_uses_common_config(
     provider: &Provider,
     snippet: Option<&str>,
 ) -> bool {
-    if matches!(app_type, AppType::CodexDesktop) {
-        return false;
-    }
-
     match provider
         .meta
         .as_ref()
@@ -574,7 +569,7 @@ pub(crate) fn remove_common_config_from_settings(
             json_deep_remove(&mut result, &source);
             Ok(result)
         }
-        AppType::Codex => {
+        AppType::Codex | AppType::CodexDesktop => {
             let mut result = settings.clone();
             let config_toml = settings.get("config").and_then(Value::as_str).unwrap_or("");
             let mut target_doc = if config_toml.trim().is_empty() {
@@ -610,8 +605,7 @@ pub(crate) fn remove_common_config_from_settings(
         | AppType::OpenClaw
         | AppType::Hermes
         | AppType::Pi
-        | AppType::ClaudeDesktop
-        | AppType::CodexDesktop => Ok(settings.clone()),
+        | AppType::ClaudeDesktop => Ok(settings.clone()),
     }
 }
 
@@ -633,7 +627,7 @@ fn apply_common_config_to_settings(
             json_deep_merge(&mut result, &source);
             Ok(result)
         }
-        AppType::Codex => {
+        AppType::Codex | AppType::CodexDesktop => {
             let mut result = settings.clone();
             let config_toml = settings.get("config").and_then(Value::as_str).unwrap_or("");
             let mut target_doc = if config_toml.trim().is_empty() {
@@ -671,8 +665,7 @@ fn apply_common_config_to_settings(
         | AppType::OpenClaw
         | AppType::Hermes
         | AppType::Pi
-        | AppType::ClaudeDesktop
-        | AppType::CodexDesktop => Ok(settings.clone()),
+        | AppType::ClaudeDesktop => Ok(settings.clone()),
     }
 }
 
@@ -681,10 +674,6 @@ pub(crate) fn build_effective_settings_with_common_config(
     app_type: &AppType,
     provider: &Provider,
 ) -> Result<Value, AppError> {
-    if matches!(app_type, AppType::CodexDesktop) {
-        return Ok(provider.settings_config.clone());
-    }
-
     let snippet = db.get_config_snippet(app_type.as_str())?;
     let mut effective_settings = provider.settings_config.clone();
 
@@ -1205,15 +1194,9 @@ pub(crate) fn normalize_provider_common_config_for_storage(
     app_type: &AppType,
     provider: &mut Provider,
 ) -> Result<(), AppError> {
-    if matches!(app_type, AppType::CodexDesktop) {
-        return Ok(());
-    }
-
     // Codex CLI MCP is projected from the database and must never become part
-    // of a provider snapshot.  In particular, a live Desktop runtime can be
-    // present in the same historical config payload while the user edits a
-    // CLI provider.  Keep the stored provider independent of that runtime
-    // table; Desktop providers deliberately take the branch above unchanged.
+    // of a provider snapshot. Desktop owns its runtime MCP tables, so only the
+    // CLI target is sanitized before common-config normalization.
     if matches!(app_type, AppType::Codex) {
         crate::codex_config::strip_codex_mcp_servers_from_settings(&mut provider.settings_config)?;
     }
@@ -2808,12 +2791,17 @@ base_url = "https://a.example/v1"
     }
 
     #[test]
-    fn codex_desktop_common_config_is_runtime_managed_and_untouched() {
+    fn codex_desktop_common_config_apply_and_remove_roundtrip_preserves_runtime_mcp() {
         let settings = json!({
             "auth": {
                 "OPENAI_API_KEY": "sk-test"
             },
-            "config": "model_provider = \"openai\"\n"
+            "config": r#"model_provider = "openai"
+
+[mcp_servers.node_repl]
+type = "stdio"
+command = "node_repl.exe"
+"#
         });
         let snippet = "[shared]\nreasoning = \"medium\"\n";
         let mut provider = Provider::with_id(
@@ -2827,18 +2815,109 @@ base_url = "https://a.example/v1"
             ..Default::default()
         });
 
-        assert!(!provider_uses_common_config(
+        assert!(provider_uses_common_config(
             &AppType::CodexDesktop,
             &provider,
             Some(snippet)
         ));
-        assert_eq!(
-            apply_common_config_to_settings(&AppType::CodexDesktop, &settings, snippet).unwrap(),
-            settings
+        let applied =
+            apply_common_config_to_settings(&AppType::CodexDesktop, &settings, snippet).unwrap();
+        let applied_config = applied["config"].as_str().unwrap_or_default();
+        assert!(applied_config.contains("[shared]"));
+        assert!(applied_config.contains("reasoning = \"medium\""));
+        assert!(
+            applied_config.contains("[mcp_servers.node_repl]"),
+            "Desktop runtime MCP must survive common-config application"
         );
-        assert_eq!(
-            remove_common_config_from_settings(&AppType::CodexDesktop, &settings, snippet).unwrap(),
-            settings
+
+        let stripped =
+            remove_common_config_from_settings(&AppType::CodexDesktop, &applied, snippet).unwrap();
+        assert_eq!(stripped, settings);
+    }
+
+    #[test]
+    fn codex_desktop_effective_settings_use_independent_common_config_key() {
+        let db = Database::memory().expect("create memory db");
+        db.set_config_snippet(
+            AppType::Codex.as_str(),
+            Some("[cli_only]\nvalue = \"cli\"\n".to_string()),
+        )
+        .expect("save CLI common config");
+        db.set_config_snippet(
+            AppType::CodexDesktop.as_str(),
+            Some("[desktop_only]\nvalue = \"desktop\"\n".to_string()),
+        )
+        .expect("save Desktop common config");
+
+        let mut provider = Provider::with_id(
+            "desktop-provider".to_string(),
+            "Desktop Provider".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "sk-desktop" },
+                "config": r#"model_provider = "openai"
+
+[mcp_servers.node_repl]
+type = "stdio"
+command = "node_repl.exe"
+"#
+            }),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            common_config_enabled: Some(true),
+            ..Default::default()
+        });
+
+        let effective =
+            build_effective_settings_with_common_config(&db, &AppType::CodexDesktop, &provider)
+                .expect("build Desktop effective settings");
+        let config = effective["config"].as_str().unwrap_or_default();
+        assert!(config.contains("[desktop_only]"));
+        assert!(config.contains("value = \"desktop\""));
+        assert!(!config.contains("[cli_only]"));
+        assert!(config.contains("[mcp_servers.node_repl]"));
+    }
+
+    #[test]
+    fn codex_desktop_storage_normalization_strips_snippet_and_preserves_runtime_mcp() {
+        let db = Database::memory().expect("create memory db");
+        let snippet = "[shared]\nreasoning = \"medium\"\n";
+        db.set_config_snippet(AppType::CodexDesktop.as_str(), Some(snippet.to_string()))
+            .expect("save Desktop common config");
+
+        let mut provider = Provider::with_id(
+            "desktop-provider".to_string(),
+            "Desktop Provider".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "sk-desktop" },
+                "config": r#"model_provider = "openai"
+
+[shared]
+reasoning = "medium"
+
+[mcp_servers.node_repl]
+type = "stdio"
+command = "node_repl.exe"
+"#
+            }),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            common_config_enabled: Some(true),
+            ..Default::default()
+        });
+
+        normalize_provider_common_config_for_storage(&db, &AppType::CodexDesktop, &mut provider)
+            .expect("normalize Desktop provider storage");
+
+        let stored_config = provider.settings_config["config"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(!stored_config.contains("[shared]"));
+        assert!(!stored_config.contains("reasoning = \"medium\""));
+        assert!(
+            stored_config.contains("[mcp_servers.node_repl]"),
+            "Desktop runtime MCP belongs to the provider and must remain stored"
         );
     }
 

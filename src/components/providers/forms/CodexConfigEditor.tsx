@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { CodexAuthSection, CodexConfigSection } from "./CodexConfigSections";
 import { CodexCommonConfigModal } from "./CodexCommonConfigModal";
@@ -11,9 +11,6 @@ interface CodexConfigEditorProps {
   providerName?: string;
 
   showRemoteCompaction?: boolean;
-
-  /** The shared common-config editor belongs to Codex CLI only. */
-  showCommonConfig?: boolean;
 
   isProxyTakeover?: boolean;
 
@@ -49,7 +46,6 @@ const CodexConfigEditor: React.FC<CodexConfigEditorProps> = ({
   configValue,
   providerName,
   showRemoteCompaction,
-  showCommonConfig = true,
   isProxyTakeover = false,
   onAuthChange,
   onConfigChange,
@@ -67,12 +63,6 @@ const CodexConfigEditor: React.FC<CodexConfigEditorProps> = ({
 }) => {
   const { t } = useTranslation();
   const [isCommonConfigModalOpen, setIsCommonConfigModalOpen] = useState(false);
-
-  useEffect(() => {
-    if (!showCommonConfig) {
-      setIsCommonConfigModalOpen(false);
-    }
-  }, [showCommonConfig]);
 
   const handleCloseCommonConfigModal = () => {
     onCommonConfigErrorClear();
@@ -104,7 +94,6 @@ const CodexConfigEditor: React.FC<CodexConfigEditorProps> = ({
         onChange={onConfigChange}
         providerName={providerName}
         showRemoteCompaction={showRemoteCompaction}
-        showCommonConfig={showCommonConfig}
         useCommonConfig={useCommonConfig}
         onCommonConfigToggle={onCommonConfigToggle}
         onEditCommonConfig={() => setIsCommonConfigModalOpen(true)}
@@ -113,17 +102,15 @@ const CodexConfigEditor: React.FC<CodexConfigEditorProps> = ({
         isProxyTakeover={isProxyTakeover}
       />
 
-      {showCommonConfig && (
-        <CodexCommonConfigModal
-          isOpen={isCommonConfigModalOpen}
-          onClose={handleCloseCommonConfigModal}
-          value={commonConfigSnippet}
-          onSave={onCommonConfigSnippetChange}
-          error={commonConfigError}
-          onExtract={onExtract}
-          isExtracting={isExtracting}
-        />
-      )}
+      <CodexCommonConfigModal
+        isOpen={isCommonConfigModalOpen}
+        onClose={handleCloseCommonConfigModal}
+        value={commonConfigSnippet}
+        onSave={onCommonConfigSnippetChange}
+        error={commonConfigError}
+        onExtract={onExtract}
+        isExtracting={isExtracting}
+      />
     </div>
   );
 };

@@ -16,6 +16,9 @@ const authState = vi.hoisted(() => ({
 const toastMocks = vi.hoisted(() => ({
   error: vi.fn(),
 }));
+const codexCommonConfigMocks = vi.hoisted(() => ({
+  hook: vi.fn(),
+}));
 
 vi.mock("sonner", () => ({
   toast: {
@@ -84,10 +87,8 @@ vi.mock("@/components/providers/forms/CodexOAuthSection", () => ({
 }));
 
 vi.mock("@/components/providers/forms/CodexConfigEditor", () => ({
-  default: ({ showCommonConfig }: { showCommonConfig?: boolean }) => (
-    <output data-testid="codex-config-editor-common-config">
-      {showCommonConfig ? "enabled" : "disabled"}
-    </output>
+  default: () => (
+    <output data-testid="codex-config-editor-common-config">enabled</output>
   ),
 }));
 
@@ -135,16 +136,19 @@ vi.mock("@/components/providers/forms/hooks", async (importOriginal) => {
       handleCommonConfigSnippetChange: vi.fn(),
       handleExtract: vi.fn(),
     }),
-    useCodexCommonConfig: () => ({
-      useCommonConfig: false,
-      commonConfigSnippet: "",
-      commonConfigError: null,
-      handleCommonConfigToggle: vi.fn(),
-      handleCommonConfigSnippetChange: vi.fn(),
-      isExtracting: false,
-      handleExtract: vi.fn(),
-      clearCommonConfigError: vi.fn(),
-    }),
+    useCodexCommonConfig: (options: { initialEnabled?: boolean }) => {
+      codexCommonConfigMocks.hook(options);
+      return {
+        useCommonConfig: options.initialEnabled === true,
+        commonConfigSnippet: "",
+        commonConfigError: null,
+        handleCommonConfigToggle: vi.fn(),
+        handleCommonConfigSnippetChange: vi.fn(),
+        isExtracting: false,
+        handleExtract: vi.fn(),
+        clearCommonConfigError: vi.fn(),
+      };
+    },
     useGeminiCommonConfig: () => ({
       useCommonConfig: false,
       commonConfigSnippet: "",
@@ -224,6 +228,7 @@ function renderCodexDesktopForm(
           meta: {
             apiFormat: "openai_responses",
             codexDesktopMode: "direct",
+            commonConfigEnabled: true,
           },
         }}
       />
@@ -241,9 +246,10 @@ describe("ProviderForm Codex Official managed account", () => {
     );
     authState.codexReauthRequired = false;
     toastMocks.error.mockReset();
+    codexCommonConfigMocks.hook.mockClear();
   });
 
-  it("persists the selected Codex Desktop connection mode", async () => {
+  it("persists Codex Desktop mode and common config state", async () => {
     Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
       configurable: true,
       value: vi.fn(),
@@ -254,7 +260,17 @@ describe("ProviderForm Codex Official managed account", () => {
 
     expect(
       screen.getByTestId("codex-config-editor-common-config"),
-    ).toHaveTextContent("disabled");
+    ).toHaveTextContent("enabled");
+    expect(codexCommonConfigMocks.hook).toHaveBeenCalledWith(
+      expect.objectContaining({
+        appType: "codex-desktop",
+        enabled: true,
+        initialEnabled: true,
+        initialData: expect.objectContaining({
+          meta: expect.objectContaining({ commonConfigEnabled: true }),
+        }),
+      }),
+    );
 
     await user.click(screen.getByRole("combobox", { name: "接入方式" }));
     await user.click(await screen.findByRole("option", { name: "本地网关" }));
@@ -262,7 +278,7 @@ describe("ProviderForm Codex Official managed account", () => {
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
     expect(onSubmit.mock.calls[0][0].meta?.codexDesktopMode).toBe("proxy");
-    expect(onSubmit.mock.calls[0][0].meta?.commonConfigEnabled).toBeUndefined();
+    expect(onSubmit.mock.calls[0][0].meta?.commonConfigEnabled).toBe(true);
   });
 
   it("describes native login using the Codex Desktop auth file", () => {

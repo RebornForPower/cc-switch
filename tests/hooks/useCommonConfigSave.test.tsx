@@ -23,59 +23,82 @@ vi.mock("@/lib/api", () => ({
 
 describe("common config snippet saving", () => {
   beforeEach(() => {
-    getCommonConfigSnippetMock.mockResolvedValue("");
-    setCommonConfigSnippetMock.mockResolvedValue(undefined);
-    extractCommonConfigSnippetMock.mockResolvedValue("");
-    updateTomlCommonConfigSnippetMock.mockImplementation(
-      async (configToml: string) => configToml,
-    );
+    window.localStorage.clear();
+    getCommonConfigSnippetMock.mockReset().mockResolvedValue("");
+    setCommonConfigSnippetMock.mockReset().mockResolvedValue(undefined);
+    extractCommonConfigSnippetMock.mockReset().mockResolvedValue("");
+    updateTomlCommonConfigSnippetMock
+      .mockReset()
+      .mockImplementation(async (configToml: string) => configToml);
   });
 
-  it("keeps the Codex Desktop target out of the CLI common-config store", async () => {
+  it("routes Codex Desktop common-config operations to its own target", async () => {
+    getCommonConfigSnippetMock.mockResolvedValue(
+      "[tui]\nnotifications = true\n",
+    );
+    extractCommonConfigSnippetMock.mockResolvedValue(
+      '[history]\npersistence = "save-all"\n',
+    );
     const onConfigChange = vi.fn();
     const { result } = renderHook(() =>
       useCodexCommonConfig({
+        appType: "codex-desktop",
         codexConfig: 'model = "gpt-5"',
         onConfigChange,
-        enabled: false,
+        initialData: { settingsConfig: { config: 'model = "gpt-5"' } },
+        initialEnabled: false,
       }),
     );
 
     await waitFor(() => expect(result.current.isLoading).toBe(false));
 
-    expect(getCommonConfigSnippetMock).not.toHaveBeenCalled();
+    expect(getCommonConfigSnippetMock).toHaveBeenCalledWith("codex-desktop");
     expect(result.current.useCommonConfig).toBe(false);
-    expect(result.current.commonConfigSnippet).toBe("");
 
     await act(async () => {
       await result.current.handleCommonConfigSnippetChange(
         'base_url = "https://example.com"',
       );
-      await result.current.handleCommonConfigToggle(true);
       await result.current.handleExtract();
     });
 
-    expect(setCommonConfigSnippetMock).not.toHaveBeenCalled();
-    expect(extractCommonConfigSnippetMock).not.toHaveBeenCalled();
+    expect(setCommonConfigSnippetMock).toHaveBeenCalledWith(
+      "codex-desktop",
+      'base_url = "https://example.com"',
+    );
+    expect(extractCommonConfigSnippetMock).toHaveBeenCalledWith(
+      "codex-desktop",
+      { settingsConfig: JSON.stringify({ config: 'model = "gpt-5"' }) },
+    );
+    expect(setCommonConfigSnippetMock).toHaveBeenCalledWith(
+      "codex-desktop",
+      '[history]\npersistence = "save-all"\n',
+    );
     expect(onConfigChange).not.toHaveBeenCalled();
   });
 
-  it("invalidates an in-flight CLI merge when the target becomes Desktop", async () => {
-    getCommonConfigSnippetMock.mockResolvedValue(
-      "[tui]\nnotifications = true\n",
+  it("invalidates an in-flight merge when the Codex target changes", async () => {
+    getCommonConfigSnippetMock.mockImplementation(async (appType: string) =>
+      appType === "codex"
+        ? "[tui]\nnotifications = true\n"
+        : "[desktop]\nenabled = true\n",
     );
     const initialData = { settingsConfig: { config: 'model = "gpt-5"' } };
     const onConfigChange = vi.fn();
     const { result, rerender } = renderHook(
-      ({ enabled }: { enabled: boolean }) =>
+      ({ appType }: { appType: "codex" | "codex-desktop" }) =>
         useCodexCommonConfig({
+          appType,
           codexConfig: 'model = "gpt-5"',
           onConfigChange,
           initialData,
           initialEnabled: false,
-          enabled,
         }),
-      { initialProps: { enabled: true } },
+      {
+        initialProps: { appType: "codex" } as {
+          appType: "codex" | "codex-desktop";
+        },
+      },
     );
 
     await waitFor(() => expect(result.current.isLoading).toBe(false));
@@ -92,7 +115,12 @@ describe("common config snippet saving", () => {
     act(() => {
       mergePending = result.current.handleCommonConfigToggle(true);
     });
-    rerender({ enabled: false });
+    rerender({ appType: "codex-desktop" });
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    await waitFor(() =>
+      expect(result.current.commonConfigSnippet).toContain("[desktop]"),
+    );
 
     await act(async () => {
       resolveMerge?.('model = "gpt-5"\n\n[tui]\nnotifications = true\n');
@@ -100,77 +128,171 @@ describe("common config snippet saving", () => {
     });
 
     expect(result.current.useCommonConfig).toBe(false);
-    expect(result.current.commonConfigSnippet).toBe("");
+    expect(result.current.commonConfigSnippet).toContain("[desktop]");
     expect(onConfigChange).not.toHaveBeenCalled();
   });
 
-  it("reloads the CLI snippet before initializing after Desktop is re-enabled", async () => {
-    let resolveLoad: ((value: string) => void) | undefined;
-    getCommonConfigSnippetMock.mockImplementationOnce(
-      () =>
-        new Promise<string>((resolve) => {
-          resolveLoad = resolve;
-        }),
-    );
+  it("does not let a stale extraction close the new target loading state", async () => {
+    let resolveCliExtract: ((value: string) => void) | undefined;
+    let resolveDesktopExtract: ((value: string) => void) | undefined;
+    extractCommonConfigSnippetMock
+      .mockImplementationOnce(
+        () =>
+          new Promise<string>((resolve) => {
+            resolveCliExtract = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<string>((resolve) => {
+            resolveDesktopExtract = resolve;
+          }),
+      );
     const onConfigChange = vi.fn();
     const { result, rerender } = renderHook(
-      ({ enabled }: { enabled: boolean }) =>
+      ({ appType }: { appType: "codex" | "codex-desktop" }) =>
         useCodexCommonConfig({
-          codexConfig: 'model = "gpt-5"',
-          onConfigChange,
-          enabled,
-        }),
-      { initialProps: { enabled: false } },
-    );
-
-    expect(result.current.isLoading).toBe(false);
-    rerender({ enabled: true });
-
-    await waitFor(() => expect(result.current.isLoading).toBe(true));
-    expect(updateTomlCommonConfigSnippetMock).not.toHaveBeenCalled();
-
-    await act(async () => {
-      resolveLoad?.("[tui]\nnotifications = true\n");
-    });
-
-    await waitFor(() => expect(result.current.isLoading).toBe(false));
-    await waitFor(() =>
-      expect(updateTomlCommonConfigSnippetMock).toHaveBeenCalledWith(
-        'model = "gpt-5"',
-        "[tui]\nnotifications = true\n",
-        true,
-      ),
-    );
-  });
-
-  it("does not reuse a stale CLI snippet when the reloaded store is empty", async () => {
-    getCommonConfigSnippetMock
-      .mockResolvedValueOnce("[tui]\nnotifications = true\n")
-      .mockResolvedValueOnce("");
-    const onConfigChange = vi.fn();
-    const { result, rerender } = renderHook(
-      ({ enabled }: { enabled: boolean }) =>
-        useCodexCommonConfig({
+          appType,
           codexConfig: 'model = "gpt-5"',
           onConfigChange,
           initialData: { settingsConfig: { config: 'model = "gpt-5"' } },
           initialEnabled: false,
-          enabled,
         }),
-      { initialProps: { enabled: true } },
+      {
+        initialProps: { appType: "codex" } as {
+          appType: "codex" | "codex-desktop";
+        },
+      },
     );
 
     await waitFor(() => expect(result.current.isLoading).toBe(false));
-    expect(result.current.commonConfigSnippet).toContain("[tui]");
 
-    rerender({ enabled: false });
-    rerender({ enabled: true });
+    let cliExtractPending: Promise<void> = Promise.resolve();
+    act(() => {
+      cliExtractPending = result.current.handleExtract();
+    });
+    await waitFor(() => expect(result.current.isExtracting).toBe(true));
+
+    rerender({ appType: "codex-desktop" });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    let desktopExtractPending: Promise<void> = Promise.resolve();
+    act(() => {
+      desktopExtractPending = result.current.handleExtract();
+    });
+    await waitFor(() => expect(result.current.isExtracting).toBe(true));
+
+    await act(async () => {
+      resolveCliExtract?.("[cli]\nvalue = 1\n");
+      await cliExtractPending;
+    });
+    expect(result.current.isExtracting).toBe(true);
+
+    await act(async () => {
+      resolveDesktopExtract?.("[desktop]\nvalue = 2\n");
+      await desktopExtractPending;
+    });
+    expect(result.current.isExtracting).toBe(false);
+    expect(setCommonConfigSnippetMock).toHaveBeenCalledWith(
+      "codex-desktop",
+      "[desktop]\nvalue = 2\n",
+    );
+    expect(setCommonConfigSnippetMock).not.toHaveBeenCalledWith(
+      "codex",
+      "[cli]\nvalue = 1\n",
+    );
+  });
+
+  it("keeps CLI and Desktop snippets isolated across target changes", async () => {
+    getCommonConfigSnippetMock.mockImplementation(async (appType: string) =>
+      appType === "codex" ? "[cli]\nvalue = 1\n" : "[desktop]\nvalue = 2\n",
+    );
+    const onConfigChange = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ appType }: { appType: "codex" | "codex-desktop" }) =>
+        useCodexCommonConfig({
+          appType,
+          codexConfig: 'model = "gpt-5"',
+          onConfigChange,
+          initialData: { settingsConfig: { config: 'model = "gpt-5"' } },
+          initialEnabled: false,
+        }),
+      {
+        initialProps: { appType: "codex" } as {
+          appType: "codex" | "codex-desktop";
+        },
+      },
+    );
 
     await waitFor(() => expect(result.current.isLoading).toBe(false));
-    expect(result.current.commonConfigSnippet).not.toContain("[tui]");
-    expect(result.current.useCommonConfig).toBe(false);
-    expect(updateTomlCommonConfigSnippetMock).not.toHaveBeenCalled();
-    expect(onConfigChange).not.toHaveBeenCalled();
+    expect(result.current.commonConfigSnippet).toContain("[cli]");
+
+    rerender({ appType: "codex-desktop" });
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    await waitFor(() =>
+      expect(result.current.commonConfigSnippet).toContain("[desktop]"),
+    );
+
+    await act(async () => {
+      await result.current.handleCommonConfigSnippetChange(
+        "[desktop]\nvalue = 3\n",
+      );
+    });
+    expect(setCommonConfigSnippetMock).toHaveBeenCalledWith(
+      "codex-desktop",
+      "[desktop]\nvalue = 3\n",
+    );
+
+    rerender({ appType: "codex" });
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    await waitFor(() =>
+      expect(result.current.commonConfigSnippet).toContain("[cli]"),
+    );
+    expect(result.current.commonConfigSnippet).not.toContain("[desktop]");
+    expect(getCommonConfigSnippetMock).toHaveBeenCalledWith("codex");
+    expect(getCommonConfigSnippetMock).toHaveBeenCalledWith("codex-desktop");
+  });
+
+  it("migrates the legacy localStorage snippet only for Codex CLI", async () => {
+    const legacySnippet = "[tui]\nnotifications = true\n";
+    window.localStorage.setItem(
+      "cc-switch:codex-common-config-snippet",
+      legacySnippet,
+    );
+    const onConfigChange = vi.fn();
+    const desktop = renderHook(() =>
+      useCodexCommonConfig({
+        appType: "codex-desktop",
+        codexConfig: 'model = "gpt-5"',
+        onConfigChange,
+      }),
+    );
+
+    await waitFor(() => expect(desktop.result.current.isLoading).toBe(false));
+    expect(setCommonConfigSnippetMock).not.toHaveBeenCalled();
+    expect(
+      window.localStorage.getItem("cc-switch:codex-common-config-snippet"),
+    ).toBe(legacySnippet);
+    desktop.unmount();
+
+    const cli = renderHook(() =>
+      useCodexCommonConfig({
+        appType: "codex",
+        codexConfig: 'model = "gpt-5"',
+        onConfigChange,
+      }),
+    );
+
+    await waitFor(() => expect(cli.result.current.isLoading).toBe(false));
+    expect(setCommonConfigSnippetMock).toHaveBeenCalledWith(
+      "codex",
+      legacySnippet,
+    );
+    expect(
+      window.localStorage.getItem("cc-switch:codex-common-config-snippet"),
+    ).toBeNull();
   });
 
   it("does not persist an invalid Codex common config snippet", async () => {

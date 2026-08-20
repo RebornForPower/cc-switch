@@ -44,6 +44,20 @@ fn configure_codex_directories(cli_dir: &Path, desktop_dir: &Path, current_provi
     .expect("configure Codex test directories");
 }
 
+fn configure_codex_desktop_directories(
+    cli_dir: &Path,
+    desktop_dir: &Path,
+    current_provider: Option<&str>,
+) {
+    update_settings(AppSettings {
+        codex_config_dir: Some(cli_dir.to_string_lossy().into_owned()),
+        codex_desktop_config_dir: Some(desktop_dir.to_string_lossy().into_owned()),
+        current_provider_codex_desktop: current_provider.map(str::to_string),
+        ..AppSettings::default()
+    })
+    .expect("configure Codex Desktop test directories");
+}
+
 fn persisted_codex_current(home: &Path) -> Option<String> {
     let text = std::fs::read_to_string(home.join(".cc-switch").join("settings.json"))
         .expect("read persisted settings");
@@ -64,6 +78,40 @@ fn codex_provider(id: &str, name: &str, marker: &str) -> Provider {
         }),
         None,
     )
+}
+
+fn codex_desktop_provider(id: &str, mode: &str) -> Provider {
+    let config = format!(
+        r#"model = "gpt-5"
+model_provider = "desktop-upstream"
+
+[model_providers.desktop-upstream]
+name = "Desktop Upstream"
+base_url = "https://desktop.example/v1"
+wire_api = "responses"
+requires_openai_auth = true
+
+{DESKTOP_NODE_REPL_CONFIG}"#
+    );
+    let mut provider = Provider::with_id(
+        id.to_string(),
+        "Desktop Provider".to_string(),
+        json!({
+            "auth": { "OPENAI_API_KEY": "sk-desktop-upstream" },
+            "config": config,
+        }),
+        None,
+    );
+    provider.category = Some("custom".to_string());
+    provider.meta = Some(
+        serde_json::from_value(json!({
+            "codexDesktopMode": mode,
+            "commonConfigEnabled": true,
+            "apiFormat": "openai_responses"
+        }))
+        .expect("deserialize Codex Desktop provider metadata"),
+    );
+    provider
 }
 
 fn codex_mcp_server(id: &str, command: &str) -> McpServer {
@@ -107,6 +155,139 @@ fn codex_desktop_runtime_node_repl_server() -> McpServer {
         docs: None,
         tags: Vec::new(),
     }
+}
+
+#[test]
+fn sync_current_codex_desktop_direct_uses_independent_common_config() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let cli_dir = home.join("codex-cli-desktop-common-direct");
+    let desktop_dir = home.join("codex-desktop-common-direct");
+    configure_codex_desktop_directories(&cli_dir, &desktop_dir, Some("desktop-direct"));
+    std::fs::create_dir_all(&cli_dir).expect("create CLI directory");
+    std::fs::create_dir_all(&desktop_dir).expect("create Desktop directory");
+    let cli_config_path = cli_dir.join("config.toml");
+    std::fs::write(&cli_config_path, "cli_live_marker = \"unchanged\"\n").expect("seed CLI config");
+
+    let state = create_test_state().expect("create test state");
+    let provider = codex_desktop_provider("desktop-direct", "direct");
+    state
+        .db
+        .save_provider(AppType::CodexDesktop.as_str(), &provider)
+        .expect("save Desktop Direct provider");
+    state
+        .db
+        .set_current_provider(AppType::CodexDesktop.as_str(), &provider.id)
+        .expect("set Desktop current provider");
+    state
+        .db
+        .set_config_snippet(
+            AppType::Codex.as_str(),
+            Some("[cli_only]\nvalue = \"cli\"\n".to_string()),
+        )
+        .expect("save CLI common config");
+    state
+        .db
+        .set_config_snippet(
+            AppType::CodexDesktop.as_str(),
+            Some("[desktop_only]\nvalue = \"desktop\"\n".to_string()),
+        )
+        .expect("save Desktop common config");
+
+    ProviderService::sync_current_provider_for_app(&state, AppType::CodexDesktop)
+        .expect("sync current Desktop Direct provider");
+
+    let desktop_config =
+        std::fs::read_to_string(desktop_dir.join("config.toml")).expect("read Desktop config");
+    assert!(desktop_config.contains("[desktop_only]"));
+    assert!(desktop_config.contains("value = \"desktop\""));
+    assert!(!desktop_config.contains("[cli_only]"));
+    assert!(desktop_config.contains("[mcp_servers.node_repl]"));
+    assert_eq!(
+        std::fs::read_to_string(&cli_config_path).expect("read unchanged CLI config"),
+        "cli_live_marker = \"unchanged\"\n"
+    );
+}
+
+#[test]
+fn sync_current_codex_desktop_proxy_preserves_gateway_and_runtime_mcp() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+    let cli_dir = home.join("codex-cli-desktop-common-proxy");
+    let desktop_dir = home.join("codex-desktop-common-proxy");
+    configure_codex_desktop_directories(&cli_dir, &desktop_dir, Some("desktop-proxy"));
+    std::fs::create_dir_all(&cli_dir).expect("create CLI directory");
+    std::fs::create_dir_all(&desktop_dir).expect("create Desktop directory");
+    let cli_config_path = cli_dir.join("config.toml");
+    std::fs::write(&cli_config_path, "cli_live_marker = \"unchanged\"\n").expect("seed CLI config");
+
+    let state = create_test_state().expect("create test state");
+    let provider = codex_desktop_provider("desktop-proxy", "proxy");
+    state
+        .db
+        .save_provider(AppType::CodexDesktop.as_str(), &provider)
+        .expect("save Desktop Proxy provider");
+    state
+        .db
+        .set_current_provider(AppType::CodexDesktop.as_str(), &provider.id)
+        .expect("set Desktop current provider");
+    state
+        .db
+        .set_config_snippet(
+            AppType::Codex.as_str(),
+            Some("[cli_only]\nvalue = \"cli\"\n".to_string()),
+        )
+        .expect("save CLI common config");
+    state
+        .db
+        .set_config_snippet(
+            AppType::CodexDesktop.as_str(),
+            Some("[desktop_only]\nvalue = \"desktop\"\n".to_string()),
+        )
+        .expect("save Desktop common config");
+    let mut proxy_config =
+        futures::executor::block_on(state.db.get_proxy_config()).expect("read proxy config");
+    proxy_config.listen_address = "127.0.0.1".to_string();
+    proxy_config.listen_port = 19_876;
+    futures::executor::block_on(state.db.update_proxy_config(proxy_config))
+        .expect("save proxy config");
+
+    ProviderService::sync_current_provider_for_app(&state, AppType::CodexDesktop)
+        .expect("sync current Desktop Proxy provider");
+
+    let desktop_config =
+        std::fs::read_to_string(desktop_dir.join("config.toml")).expect("read Desktop config");
+    let desktop_auth: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(desktop_dir.join("auth.json")).expect("read Desktop auth"),
+    )
+    .expect("parse Desktop auth");
+    let gateway_token = desktop_auth["OPENAI_API_KEY"]
+        .as_str()
+        .expect("Desktop gateway token");
+    assert!(desktop_config.contains("[desktop_only]"));
+    assert!(desktop_config.contains("value = \"desktop\""));
+    assert!(!desktop_config.contains("[cli_only]"));
+    assert!(desktop_config.contains("[mcp_servers.node_repl]"));
+    assert!(desktop_config.contains("model_provider = \"cc-switch-desktop\""));
+    assert!(desktop_config.contains("http://127.0.0.1:19876/codex-desktop/v1"));
+    assert!(desktop_config.contains(gateway_token));
+    assert_eq!(
+        std::fs::read_to_string(&cli_config_path).expect("read unchanged CLI config"),
+        "cli_live_marker = \"unchanged\"\n"
+    );
+
+    let stored = state
+        .db
+        .get_provider_by_id(&provider.id, AppType::CodexDesktop.as_str())
+        .expect("read stored Desktop provider")
+        .expect("stored Desktop provider exists");
+    let stored_config = stored.settings_config["config"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(!stored_config.contains("cc-switch-desktop"));
+    assert!(!stored_config.contains(gateway_token));
 }
 
 #[test]

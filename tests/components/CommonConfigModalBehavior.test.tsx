@@ -84,12 +84,11 @@ describe("Common config modals", () => {
     );
   });
 
-  it("does not render the shared common config controls for Codex Desktop", () => {
+  it("renders the shared common config controls for Codex Desktop", () => {
     render(
       <CodexConfigEditor
         authValue="{}"
         configValue=""
-        showCommonConfig={false}
         onAuthChange={() => {}}
         onConfigChange={() => {}}
         useCommonConfig={false}
@@ -104,13 +103,13 @@ describe("Common config modals", () => {
     );
 
     expect(
-      screen.queryByRole("button", {
+      screen.getByRole("button", {
         name: /codexConfig.editCommonConfig|编辑通用配置/,
       }),
-    ).not.toBeInTheDocument();
+    ).toBeInTheDocument();
     expect(
-      screen.queryByText(/codexConfig.writeCommonConfig|写入通用配置/),
-    ).not.toBeInTheDocument();
+      screen.getByText(/codexConfig.writeCommonConfig|写入通用配置/),
+    ).toBeInTheDocument();
   });
 
   it("keeps the Gemini common config modal closed after user closes it with an error present", async () => {

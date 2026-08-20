@@ -1650,6 +1650,47 @@ command = "legacy-cmd"
         );
     }
 
+    #[test]
+    fn extract_codex_desktop_common_config_uses_codex_toml_projection() {
+        let settings = json!({
+            "auth": { "OPENAI_API_KEY": "sk-desktop" },
+            "config": r#"model = "gpt-5"
+model_provider = "desktop"
+disable_response_storage = true
+
+[model_providers.desktop]
+name = "Desktop"
+base_url = "https://desktop.example/v1"
+wire_api = "responses"
+
+[mcp_servers.node_repl]
+type = "stdio"
+command = "node_repl.exe"
+"#
+        });
+
+        let extracted = ProviderService::extract_common_config_snippet_from_settings(
+            AppType::CodexDesktop,
+            &settings,
+        )
+        .expect("extract Desktop common config");
+
+        assert!(extracted.contains("disable_response_storage = true"));
+        for excluded in [
+            "model =",
+            "model_provider",
+            "model_providers",
+            "desktop.example",
+            "mcp_servers",
+            "node_repl",
+        ] {
+            assert!(
+                !extracted.contains(excluded),
+                "Desktop common config must exclude '{excluded}', got: {extracted}"
+            );
+        }
+    }
+
     #[tokio::test]
     #[serial]
     async fn update_current_claude_provider_syncs_live_when_proxy_takeover_detected_without_backup()
@@ -5937,10 +5978,6 @@ impl ProviderService {
         state: &AppState,
         app_type: AppType,
     ) -> Result<String, AppError> {
-        if matches!(app_type, AppType::CodexDesktop) {
-            return Ok(String::new());
-        }
-
         // Get current provider
         let current_id = Self::current(state, app_type.clone())?;
         if current_id.is_empty() {
@@ -5954,8 +5991,10 @@ impl ProviderService {
 
         match app_type {
             AppType::Claude => Self::extract_claude_common_config(&provider.settings_config),
-            AppType::ClaudeDesktop | AppType::CodexDesktop => Ok(String::new()),
-            AppType::Codex => Self::extract_codex_common_config(&provider.settings_config),
+            AppType::ClaudeDesktop => Ok(String::new()),
+            AppType::Codex | AppType::CodexDesktop => {
+                Self::extract_codex_common_config(&provider.settings_config)
+            }
             AppType::Gemini => Self::extract_gemini_common_config(&provider.settings_config),
             AppType::GrokBuild => Ok(String::new()),
             AppType::OpenCode => Self::extract_opencode_common_config(&provider.settings_config),
@@ -5972,8 +6011,10 @@ impl ProviderService {
     ) -> Result<String, AppError> {
         match app_type {
             AppType::Claude => Self::extract_claude_common_config(settings_config),
-            AppType::ClaudeDesktop | AppType::CodexDesktop => Ok(String::new()),
-            AppType::Codex => Self::extract_codex_common_config(settings_config),
+            AppType::ClaudeDesktop => Ok(String::new()),
+            AppType::Codex | AppType::CodexDesktop => {
+                Self::extract_codex_common_config(settings_config)
+            }
             AppType::Gemini => Self::extract_gemini_common_config(settings_config),
             AppType::GrokBuild => Ok(String::new()),
             AppType::OpenCode => Self::extract_opencode_common_config(settings_config),

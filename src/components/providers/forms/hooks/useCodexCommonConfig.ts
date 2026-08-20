@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { parse as parseToml } from "smol-toml";
 import { hasTomlCommonConfigSnippet } from "@/utils/providerConfigUtils";
 import { configApi } from "@/lib/api";
+import type { CodexAppId } from "@/lib/api";
 import { normalizeTomlText } from "@/utils/textNormalization";
 
 /**
@@ -31,6 +32,7 @@ const DEFAULT_CODEX_COMMON_CONFIG_SNIPPET = `# Common Codex config
 # Add your common TOML configuration here`;
 
 interface UseCodexCommonConfigProps {
+  appType?: CodexAppId;
   codexConfig: string;
   onConfigChange: (config: string) => void;
   initialData?: {
@@ -38,7 +40,7 @@ interface UseCodexCommonConfigProps {
   };
   initialEnabled?: boolean;
   selectedPresetId?: string;
-  /** Common configuration is only supported for the Codex CLI provider. */
+  /** Disable the hook while the shared provider form renders another app. */
   enabled?: boolean;
 }
 
@@ -47,6 +49,7 @@ interface UseCodexCommonConfigProps {
  * 从 config.json 读取和保存，支持从 localStorage 平滑迁移
  */
 export function useCodexCommonConfig({
+  appType = "codex",
   codexConfig,
   onConfigChange,
   initialData,
@@ -69,13 +72,16 @@ export function useCodexCommonConfig({
   const hasInitializedNewMode = useRef(false);
   // 用于跟踪编辑模式是否已初始化显式开关/预览
   const hasInitializedEditMode = useRef(false);
-  // 初始化逻辑只能在当前 enabled 周期的片段加载完成后运行。否则从
-  // Desktop 切回 CLI 的首帧会使用上一个周期的状态提前初始化。
+  // 初始化逻辑只能在当前目标的片段加载完成后运行，否则切换目标后的
+  // 首帧会使用上一个目标的状态提前初始化。
   const commonConfigReadyRef = useRef(false);
   // 后端 TOML 合并是异步的：连续操作（快速点开关、连点保存）可能乱序
   // 返回。每个写 config 的异步操作在发起时领取递增序号，结果落地前
   // 校验自己仍是最新一次；过期结果直接丢弃，保证最后一次操作胜出。
   const tomlOpSeqRef = useRef(0);
+  // 提取有独立的加载状态序号。旧目标/旧请求的 finally 不能关闭当前
+  // 目标中较新的提取加载状态。
+  const extractOpSeqRef = useRef(0);
   // 镜像最新的 codexConfig：用户在编辑器手动改动走父组件 onChange，
   // 不经过本 hook（序号不变）。异步结果落地前还要校验发起时的 config
   // 基线未被外部改写，否则会覆盖用户在请求在飞期间的手动编辑。
@@ -94,20 +100,21 @@ export function useCodexCommonConfig({
   );
 
   // CLI/Desktop 共用表单组件。目标变化时让此前所有异步 TOML 操作失效，
-  // 并为下一次 CLI 启用周期重新执行加载和初始化。
+  // 并为新目标重新执行加载和初始化。
   useEffect(() => {
     tomlOpSeqRef.current += 1;
+    extractOpSeqRef.current += 1;
     commonConfigReadyRef.current = false;
     hasInitializedNewMode.current = false;
     hasInitializedEditMode.current = false;
     isUpdatingFromCommonConfig.current = false;
     setUseCommonConfig(false);
-    // Do not let a previously loaded CLI snippet survive a target change.
-    // If the next CLI load is empty, keeping it would reapply stale settings.
+    // Do not let a previously loaded snippet survive a target change. If the
+    // next target is empty, keeping it would reapply another target's settings.
     setCommonConfigSnippetState(DEFAULT_CODEX_COMMON_CONFIG_SNIPPET);
     setCommonConfigError("");
     setIsExtracting(false);
-  }, [enabled]);
+  }, [appType, enabled]);
 
   // 当预设变化时，重置初始化标记，使新预设能够重新触发初始化逻辑
   useEffect(() => {
@@ -155,21 +162,21 @@ export function useCodexCommonConfig({
     const loadSnippet = async () => {
       try {
         // 使用统一 API 加载
-        const snippet = await configApi.getCommonConfigSnippet("codex");
+        const snippet = await configApi.getCommonConfigSnippet(appType);
 
         if (snippet && snippet.trim()) {
           if (mounted) {
             setCommonConfigSnippetState(snippet);
           }
         } else {
-          // 如果 config.json 中没有，尝试从 localStorage 迁移
-          if (typeof window !== "undefined") {
+          // 旧 localStorage 键只属于 Codex CLI，不能迁移给 Desktop。
+          if (appType === "codex" && typeof window !== "undefined") {
             try {
               const legacySnippet =
                 window.localStorage.getItem(LEGACY_STORAGE_KEY);
               if (legacySnippet && legacySnippet.trim()) {
                 // 迁移到 config.json
-                await configApi.setCommonConfigSnippet("codex", legacySnippet);
+                await configApi.setCommonConfigSnippet(appType, legacySnippet);
                 if (mounted) {
                   setCommonConfigSnippetState(legacySnippet);
                 }
@@ -199,7 +206,7 @@ export function useCodexCommonConfig({
     return () => {
       mounted = false;
     };
-  }, [enabled]);
+  }, [appType, enabled]);
 
   // 初始化时检查通用配置片段（编辑模式）
   useEffect(() => {
@@ -450,7 +457,7 @@ export function useCodexCommonConfig({
 
         setCommonConfigSnippetState("");
         configApi
-          .setCommonConfigSnippet("codex", "")
+          .setCommonConfigSnippet(appType, "")
           .catch((error: unknown) => {
             if (isTomlOpStale(seq, codexConfig)) {
               return;
@@ -513,7 +520,7 @@ export function useCodexCommonConfig({
       setCommonConfigError("");
       setCommonConfigSnippetState(value);
       configApi
-        .setCommonConfigSnippet("codex", value)
+        .setCommonConfigSnippet(appType, value)
         .catch((error: unknown) => {
           if (isTomlOpStale(seq, codexConfig)) {
             return;
@@ -527,6 +534,7 @@ export function useCodexCommonConfig({
       return true;
     },
     [
+      appType,
       commonConfigSnippet,
       codexConfig,
       isTomlOpStale,
@@ -567,11 +575,12 @@ export function useCodexCommonConfig({
       return;
     }
     const seq = ++tomlOpSeqRef.current;
+    const extractSeq = ++extractOpSeqRef.current;
     setIsExtracting(true);
     setCommonConfigError("");
 
     try {
-      const extracted = await configApi.extractCommonConfigSnippet("codex", {
+      const extracted = await configApi.extractCommonConfigSnippet(appType, {
         settingsConfig: JSON.stringify({
           config: codexConfig ?? "",
         }),
@@ -590,7 +599,7 @@ export function useCodexCommonConfig({
       setCommonConfigSnippetState(extracted);
 
       // 保存到后端
-      await configApi.setCommonConfigSnippet("codex", extracted);
+      await configApi.setCommonConfigSnippet(appType, extracted);
     } catch (error) {
       if (isTomlOpStale(seq, codexConfig)) {
         return;
@@ -600,9 +609,11 @@ export function useCodexCommonConfig({
         t("codexConfig.extractFailed", { error: String(error) }),
       );
     } finally {
-      setIsExtracting(false);
+      if (extractSeq === extractOpSeqRef.current) {
+        setIsExtracting(false);
+      }
     }
-  }, [codexConfig, enabled, isTomlOpStale, t]);
+  }, [appType, codexConfig, enabled, isTomlOpStale, t]);
 
   const clearCommonConfigError = useCallback(() => {
     setCommonConfigError("");
