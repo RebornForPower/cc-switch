@@ -39,6 +39,7 @@ import {
   type AppId,
   type ProviderSwitchEvent,
 } from "@/lib/api";
+import { useAutoFailoverEnabled } from "@/lib/query/failover";
 import { checkAllEnvConflicts, checkEnvConflicts } from "@/lib/api/env";
 import { useProviderActions } from "@/hooks/useProviderActions";
 import { openclawKeys, useOpenClawHealth } from "@/hooks/useOpenClaw";
@@ -110,6 +111,7 @@ import HermesMemoryPanel from "@/components/hermes/HermesMemoryPanel";
 import {
   APP_IDS,
   DEFAULT_VISIBLE_APPS,
+  isFailoverAppId,
   isProxyAppId,
 } from "@/config/appConfig";
 
@@ -281,21 +283,29 @@ function App() {
     takeoverStatus,
     status: proxyStatus,
   } = useProxyStatus();
+  const { data: codexDesktopFailoverEnabled = false } = useAutoFailoverEnabled(
+    "codex-desktop",
+    activeApp === "codex-desktop",
+  );
   const proxyAppId = isProxyAppId(activeApp) ? activeApp : null;
+  const failoverAppId = isFailoverAppId(activeApp) ? activeApp : null;
   const currentAppUsesProxy =
     proxyAppId !== null ||
     activeApp === "claude-desktop" ||
     activeApp === "codex-desktop";
-  const isCurrentAppTakeoverActive = proxyAppId
-    ? takeoverStatus?.[proxyAppId] || false
-    : false;
+  const isCurrentAppTakeoverActive =
+    activeApp === "codex-desktop"
+      ? isProxyRunning && codexDesktopFailoverEnabled
+      : proxyAppId
+        ? takeoverStatus?.[proxyAppId] || false
+        : false;
   const activeProviderId = useMemo(() => {
-    if (!proxyAppId) return undefined;
+    if (!failoverAppId) return undefined;
     const target = proxyStatus?.active_targets?.find(
-      (t) => t.app_type === proxyAppId,
+      (t) => t.app_type === failoverAppId,
     );
     return target?.provider_id;
-  }, [proxyStatus?.active_targets, proxyAppId]);
+  }, [proxyStatus?.active_targets, failoverAppId]);
 
   const { data, isLoading, refetch } = useProvidersQuery(activeApp, {
     isProxyRunning: currentAppUsesProxy && isProxyRunning,
@@ -1391,7 +1401,12 @@ function App() {
                   {activeApp === "claude-desktop" ? (
                     <ClaudeDesktopRouteToggle />
                   ) : activeApp === "codex-desktop" ? (
-                    <ClaudeDesktopRouteToggle target="codex" />
+                    <>
+                      <ClaudeDesktopRouteToggle target="codex" />
+                      {settingsData?.enableFailoverToggle && (
+                        <FailoverToggle activeApp="codex-desktop" />
+                      )}
+                    </>
                   ) : proxyAppId ? (
                     <>
                       {settingsData?.enableLocalProxy && (

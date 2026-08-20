@@ -2803,7 +2803,8 @@
     "tooltip": {
       "enabled": "{{app}} failover enabled\nRequests follow queue priority (P1→P2→...)",
       "disabled": "Enable {{app}} failover\nSwitches to queue P1 immediately, then falls back on failures",
-      "takeoverRequired": "Take over {{app}} first, then enable failover"
+      "takeoverRequired": "Take over {{app}} first, then enable failover",
+      "localRouteRequired": "Start {{app}} local routing before enabling failover"
     }
   },
   "proxy": {

@@ -19,14 +19,14 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ToggleRow } from "@/components/ui/toggle-row";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
 import type { SettingsFormState } from "@/hooks/useSettings";
-import { getAppLabel, PROXY_APP_IDS } from "@/config/appConfig";
+import { FAILOVER_APP_IDS, getAppLabel } from "@/config/appConfig";
 
 interface ProxyTabContentProps {
   settings: SettingsFormState;
   onAutoSave: (updates: Partial<SettingsFormState>) => Promise<boolean | void>;
 }
 
-export const FAILOVER_APPS = PROXY_APP_IDS.map((id) => ({
+export const FAILOVER_APPS = FAILOVER_APP_IDS.map((id) => ({
   id,
   label: getAppLabel(id),
 }));
@@ -178,7 +178,7 @@ export function ProxyTabContent({
               )}
 
               <Tabs defaultValue="claude" className="w-full">
-                <TabsList className="grid w-full grid-cols-4">
+                <TabsList className="grid w-full grid-cols-2 sm:grid-cols-5">
                   {FAILOVER_APPS.map(({ id, label }) => (
                     <TabsTrigger key={id} value={id}>
                       {label}
@@ -186,8 +186,10 @@ export function ProxyTabContent({
                   ))}
                 </TabsList>
                 {FAILOVER_APPS.map(({ id: appType }) => {
+                  const isCodexDesktop = appType === "codex-desktop";
                   const failoverDisabled =
-                    !isRunning || !(takeoverStatus?.[appType] ?? false);
+                    !isRunning ||
+                    (!isCodexDesktop && !(takeoverStatus?.[appType] ?? false));
                   return (
                     <TabsContent
                       key={appType}
@@ -208,12 +210,14 @@ export function ProxyTabContent({
                           disabled={failoverDisabled}
                         />
                       </div>
-                      <div className="border-t border-border/50 pt-6">
-                        <AutoFailoverConfigPanel
-                          appType={appType}
-                          disabled={failoverDisabled}
-                        />
-                      </div>
+                      {!isCodexDesktop && (
+                        <div className="border-t border-border/50 pt-6">
+                          <AutoFailoverConfigPanel
+                            appType={appType}
+                            disabled={failoverDisabled}
+                          />
+                        </div>
+                      )}
                     </TabsContent>
                   );
                 })}

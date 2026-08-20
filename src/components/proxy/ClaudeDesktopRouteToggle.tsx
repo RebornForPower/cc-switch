@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { Switch } from "@/components/ui/switch";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
 import { cn } from "@/lib/utils";
+import { useAutoFailoverEnabled } from "@/lib/query/failover";
 
 interface ClaudeDesktopRouteToggleProps {
   className?: string;
@@ -26,11 +27,17 @@ export function ClaudeDesktopRouteToggle({
   } = useProxyStatus();
 
   const isBusy = isStarting || isStoppingServer;
+  // Claude Desktop and Codex Desktop share this gateway. Always observe the
+  // independent Codex Desktop failover flag so either route toggle protects
+  // the gateway while Desktop still depends on it.
+  const { data: codexDesktopFailoverEnabled = false } =
+    useAutoFailoverEnabled("codex-desktop");
   const otherTakeoverActive = Boolean(
     takeoverStatus?.claude ||
       takeoverStatus?.codex ||
       takeoverStatus?.gemini ||
-      takeoverStatus?.grokbuild,
+      takeoverStatus?.grokbuild ||
+      codexDesktopFailoverEnabled,
   );
   const routeAddress = status?.address ?? "127.0.0.1";
   const routePort = status?.port ?? 15721;

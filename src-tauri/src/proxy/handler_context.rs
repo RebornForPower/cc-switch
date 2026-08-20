@@ -95,14 +95,12 @@ impl RequestContext {
     ) -> Result<Self, ProxyError> {
         let start_time = Instant::now();
 
-        // Only apps with a proxy_config row inherit retry/failover settings.
-        // Codex Desktop uses the shared gateway transport, but owns an
-        // independent Provider namespace and deliberately has no proxy_config
-        // row (or schema migration).
-        let app_config = if app_type.supports_local_proxy() {
-            state
-                .db
-                .get_proxy_config_for_app(app_type_str)
+        // Full Live-takeover apps read their own proxy_config row. Codex
+        // Desktop shares the gateway but keeps its failover switch in the
+        // settings table; its retry/circuit values are copied in memory from
+        // the Codex CLI row (with built-in defaults as a fallback).
+        let app_config = if app_type.supports_failover() {
+            crate::proxy::provider_router::get_runtime_proxy_config(&state.db, app_type_str)
                 .await
                 .map_err(|e| ProxyError::DatabaseError(e.to_string()))?
         } else {

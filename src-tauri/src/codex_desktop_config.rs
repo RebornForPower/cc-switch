@@ -43,7 +43,16 @@ pub fn provider_mode(provider: &Provider) -> CodexDesktopMode {
         .as_ref()
         .and_then(|meta| meta.codex_desktop_mode.clone())
         .unwrap_or_else(|| {
-            if is_compatible_direct_provider(provider) {
+            // `codexDesktopMode` was added after the Desktop namespace was
+            // introduced.  Older rows were copied from Codex CLI and may
+            // carry `apiFormat = openai_responses`, which describes the CLI
+            // upstream protocol rather than Desktop's routing mode.  Treat
+            // those legacy third-party rows as gateway-backed so they remain
+            // eligible for Desktop failover.  New writes always persist an
+            // explicit mode, so an intentional direct provider is unchanged.
+            if provider.category.as_deref() == Some("official")
+                || crate::proxy::providers::is_codex_official_provider(provider)
+            {
                 CodexDesktopMode::Direct
             } else {
                 CodexDesktopMode::Proxy
@@ -158,6 +167,75 @@ pub fn apply_provider(db: &Database, provider: &Provider) -> Result<(), AppError
                 &CodexPaths::for_target(CodexTarget::Desktop).managed_oauth_marker,
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Update the Desktop gateway endpoint after the shared proxy address changes.
+///
+/// This deliberately rewrites only `config.toml`: Desktop's gateway token in
+/// `auth.json` remains valid, and changing a listener must not replace the
+/// selected provider's independent credentials or configuration.
+pub fn refresh_gateway_route(db: &Database) -> Result<(), AppError> {
+    crate::codex_config::ensure_codex_target_isolated(CodexTarget::Desktop)?;
+
+    let config_text = crate::codex_config::read_codex_config_text_for(CodexTarget::Desktop)?;
+    let base_url = proxy_gateway_base_url_from_db(db)?;
+    let token = get_or_create_gateway_token(db)?;
+    let routed =
+        crate::codex_config::apply_codex_desktop_gateway_route(&config_text, &base_url, &token)?;
+
+    crate::codex_config::write_codex_live_config_atomic_for(CodexTarget::Desktop, Some(&routed))
+}
+
+/// Refresh only the cc-switch-owned Codex Desktop model catalog for a
+/// failover target.  Failover keeps Desktop's gateway route and credentials
+/// untouched; the catalog is separate state served by the gateway's `/models`
+/// endpoint and must follow the newly selected provider.
+pub fn refresh_model_catalog(provider: &Provider) -> Result<(), AppError> {
+    crate::codex_config::ensure_codex_target_isolated(CodexTarget::Desktop)?;
+
+    let has_model_specs = provider
+        .settings_config
+        .get("modelCatalog")
+        .and_then(|catalog| catalog.get("models"))
+        .and_then(Value::as_array)
+        .is_some_and(|models| {
+            models.iter().any(|model| {
+                model
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| !name.trim().is_empty())
+            })
+        });
+    if !has_model_specs {
+        crate::config::delete_file(&crate::codex_config::get_codex_model_catalog_path_for(
+            CodexTarget::Desktop,
+        ))?;
+        return Ok(());
+    }
+
+    let config_text = provider
+        .settings_config
+        .get("config")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let prepared = crate::codex_config::prepare_codex_config_text_with_model_catalog_for(
+        CodexTarget::Desktop,
+        &provider.settings_config,
+        config_text,
+        // Every Desktop failover target is served through the shared gateway,
+        // so its catalog must use the same Chat Completions profile as the
+        // normal Desktop Proxy apply path, regardless of the upstream API.
+        CodexCatalogToolProfile::ProxyChat,
+    )?;
+    if !prepared.contains(crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME) {
+        // The previous target may have owned a catalog while this one does
+        // not. Remove only the known cc-switch file; the Desktop config still
+        // remains untouched and any user-managed external catalog is safe.
+        crate::config::delete_file(&crate::codex_config::get_codex_model_catalog_path_for(
+            CodexTarget::Desktop,
+        ))?;
     }
     Ok(())
 }

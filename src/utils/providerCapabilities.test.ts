@@ -2,7 +2,9 @@ import { describe, it, expect } from "vitest";
 import type { Provider } from "@/types";
 import type { AppId } from "@/lib/api";
 import {
+  codexDesktopProviderSupportsFailover,
   providerNeedsRouting,
+  resolveCodexDesktopProviderMode,
   resolveCodexOfficialIdentity,
   supportsOfficialProxyTakeover,
 } from "@/utils/providerCapabilities";
@@ -410,6 +412,36 @@ describe("providerNeedsRouting", () => {
           }),
         ),
       ).toBe(true);
+    });
+
+    it("缺少显式 mode 的旧 Responses 配置按 Rust fallback 使用网关", () => {
+      const legacy = mkProvider({
+        category: "custom",
+        settingsConfig: { config: codexConfig("responses") },
+      });
+
+      expect(resolveCodexDesktopProviderMode(legacy)).toBe("proxy");
+      expect(providerNeedsRouting("codex-desktop", legacy)).toBe(true);
+      expect(codexDesktopProviderSupportsFailover(legacy)).toBe(true);
+    });
+
+    it("只有显式 Desktop mode 才能声明 Direct，旧 Responses meta 仍走网关", () => {
+      const native = mkProvider({
+        category: "custom",
+        meta: { apiFormat: "openai_responses" },
+        settingsConfig: { config: codexConfig("responses") },
+      });
+
+      expect(resolveCodexDesktopProviderMode(native)).toBe("proxy");
+      expect(providerNeedsRouting("codex-desktop", native)).toBe(true);
+      expect(codexDesktopProviderSupportsFailover(native)).toBe(true);
+
+      expect(
+        resolveCodexDesktopProviderMode({
+          ...native,
+          meta: { apiFormat: "openai_responses", codexDesktopMode: "direct" },
+        }),
+      ).toBe("direct");
     });
   });
 });

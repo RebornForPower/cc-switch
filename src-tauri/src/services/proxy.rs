@@ -20,7 +20,7 @@ use serde_json::{json, Map, Value};
 use std::str::FromStr;
 use std::sync::Arc;
 use tauri::Emitter;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// 用于接管 Live 配置时的占位符（避免客户端提示缺少 key，同时不泄露真实 Token）
 const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
@@ -498,6 +498,10 @@ pub struct ProxyService {
     /// AppHandle，用于传递给 ProxyServer 以支持故障转移时的 UI 更新
     app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
     switch_locks: SwitchLockManager,
+    /// Serializes operations that start/stop the shared gateway or change
+    /// whether Codex Desktop depends on it. Per-app switch locks alone cannot
+    /// protect a delayed profile/tray stop from a concurrent Desktop toggle.
+    gateway_lifecycle_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -523,6 +527,7 @@ impl ProxyService {
             server: Arc::new(RwLock::new(None)),
             app_handle: Arc::new(RwLock::new(None)),
             switch_locks: SwitchLockManager::new(),
+            gateway_lifecycle_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1026,8 +1031,22 @@ impl ProxyService {
         self.switch_locks.lock_for_app(app_type).await
     }
 
+    /// 获取共享网关生命周期锁。
+    ///
+    /// 调用方应先持有应用级切换锁，再获取此锁，保持与 Desktop 故障转移
+    /// 切换相同的锁顺序，避免项目切换与路由开关并发时互相等待。
+    pub(crate) async fn lock_gateway_lifecycle(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.gateway_lifecycle_lock.clone().lock_owned().await
+    }
+
     /// 启动代理服务器
     pub async fn start(&self) -> Result<ProxyServerInfo, String> {
+        let _gateway_guard = self.lock_gateway_lifecycle().await;
+        self.start_inner().await
+    }
+
+    /// 启动代理服务器；调用方必须已经持有共享网关生命周期锁。
+    async fn start_inner(&self) -> Result<ProxyServerInfo, String> {
         // 1. 启动时自动设置 proxy_enabled = true
         let mut global_config = self
             .db
@@ -1465,21 +1484,13 @@ impl ProxyService {
             .await
             .map_err(|e| format!("清除 {app_type_str} 健康状态失败: {e}"))?;
 
-        // 5) 若无其它接管，更新旧标志，并停止代理服务
-        // 检查是否还有其它 app 的 enabled = true
-        let any_enabled = self
-            .db
-            .is_live_takeover_active()
-            .await
-            .map_err(|e| format!("检查接管状态失败: {e}"))?;
-
-        if !any_enabled {
-            let _ = self.db.set_live_takeover_active(false).await;
-
-            if self.is_running().await {
-                // 此时没有任何 app 处于接管状态，停止服务即可
-                let _ = self.stop().await;
-            }
+        // 5) 若无其它接管且 Desktop 未使用共享网关，更新旧标志并停止代理服务。
+        // Codex Desktop 的故障转移开关保存在 settings 表，而不是
+        // proxy_config.enabled；不能只看 is_live_takeover_active()，否则
+        // 关闭最后一个 CLI 接管时会误停共享网关，Desktop 开关也会因网关
+        // 已停止而无法再关闭。
+        if let Err(error) = self.stop_if_no_active_gateway_consumer().await {
+            log::warn!("检查并停止空闲共享网关失败: {error}");
         }
 
         Ok(())
@@ -1835,6 +1846,12 @@ impl ProxyService {
 
     /// 停止代理服务器
     pub async fn stop(&self) -> Result<(), String> {
+        let _gateway_guard = self.lock_gateway_lifecycle().await;
+        self.stop_inner().await
+    }
+
+    /// 停止代理服务器；调用方必须已经持有共享网关生命周期锁。
+    async fn stop_inner(&self) -> Result<(), String> {
         if let Some(server) = self.server.write().await.take() {
             server
                 .stop()
@@ -1862,16 +1879,97 @@ impl ProxyService {
         }
     }
 
+    /// 当没有任何功能再使用共享网关时停止它。
+    ///
+    /// 把“检查使用者”和“停止服务”放在同一把锁下，避免项目切换的
+    /// 异步收尾误停刚刚开启的 Codex Desktop 故障转移。
+    pub(crate) async fn stop_if_no_active_gateway_consumer(&self) -> Result<bool, String> {
+        let _gateway_guard = self.lock_gateway_lifecycle().await;
+        if self.has_active_gateway_consumer().await? {
+            return Ok(false);
+        }
+
+        let _ = self.db.set_live_takeover_active(false).await;
+        if !self.is_running().await {
+            return Ok(false);
+        }
+
+        self.stop_inner().await?;
+        Ok(true)
+    }
+
+    /// 停止共享网关（用户手动操作）。
+    ///
+    /// 把接管状态检查和停止动作放在同一生命周期锁中，避免 Codex
+    /// Desktop 故障转移刚开启时仍按旧状态关闭网关。
+    pub async fn stop_for_manual_request(&self) -> Result<(), String> {
+        let _gateway_guard = self.lock_gateway_lifecycle().await;
+        if self
+            .db
+            .get_codex_desktop_auto_failover_enabled()
+            .map_err(|error| format!("读取 Codex Desktop 故障转移状态失败: {error}"))?
+        {
+            return Err(
+                "Codex Desktop 故障转移仍处于启用状态，请先关闭故障转移后再停止本地路由。"
+                    .to_string(),
+            );
+        }
+
+        if self.codex_desktop_uses_gateway().await? {
+            return Err(
+                "Codex Desktop 当前 Proxy 模式供应商仍在使用本地路由，请先切换到 Direct 或官方供应商后再停止本地路由。"
+                    .to_string(),
+            );
+        }
+
+        let takeover = self.get_takeover_status().await?;
+        if takeover.claude
+            || takeover.codex
+            || takeover.gemini
+            || takeover.grokbuild
+            || takeover.opencode
+            || takeover.openclaw
+        {
+            return Err(
+                "仍有应用处于代理接管状态，请先在设置中关闭对应应用接管后再停止本地路由。"
+                    .to_string(),
+            );
+        }
+
+        self.stop_inner().await
+    }
+
     /// 停止代理服务器（恢复 Live 配置，用户手动关闭时使用）
     ///
     /// 会清除 settings 表中的代理状态，下次启动不会自动恢复。
     pub async fn stop_with_restore(&self) -> Result<(), String> {
-        // 1. 停止代理服务器（即使未运行也继续执行恢复逻辑）
-        if let Err(e) = self.stop().await {
-            log::warn!("停止代理服务器失败（将继续恢复 Live 配置）: {e}");
+        {
+            let _gateway_guard = self.lock_gateway_lifecycle().await;
+            if self
+                .db
+                .get_codex_desktop_auto_failover_enabled()
+                .map_err(|error| format!("读取 Codex Desktop 故障转移状态失败: {error}"))?
+            {
+                return Err(
+                    "Codex Desktop 故障转移仍处于启用状态，请先关闭故障转移后再停止本地路由。"
+                        .to_string(),
+                );
+            }
+
+            if self.codex_desktop_uses_gateway().await? {
+                return Err(
+                    "Codex Desktop 当前 Proxy 模式供应商仍在使用本地路由，请先切换到 Direct 或官方供应商后再停止本地路由。"
+                        .to_string(),
+                );
+            }
+
+            // 1. 停止代理服务器（即使未运行也继续执行恢复逻辑）
+            if let Err(e) = self.stop_inner().await {
+                log::warn!("停止代理服务器失败（将继续恢复 Live 配置）: {e}");
+            }
         }
 
-        // 2. 恢复原始 Live 配置
+        // 2. 恢复原始 Live 配置（不持有网关锁，避免与应用级切换锁反向等待）
         self.restore_live_configs().await?;
 
         // 3. 清除 proxy_config 表中的接管状态（兼容旧版）
@@ -1913,12 +2011,16 @@ impl ProxyService {
     ///
     /// 用于程序正常退出时，保留代理状态以便下次启动时自动恢复
     pub async fn stop_with_restore_keep_state(&self) -> Result<(), String> {
-        // 1. 停止代理服务器（即使未运行也继续执行恢复逻辑）
-        if let Err(e) = self.stop().await {
-            log::warn!("停止代理服务器失败（将继续恢复 Live 配置）: {e}");
+        {
+            let _gateway_guard = self.lock_gateway_lifecycle().await;
+            // 1. 停止代理服务器（即使未运行也继续执行恢复逻辑）。退出清理
+            // 允许停止，不受 Desktop 故障转移开关的用户操作限制。
+            if let Err(e) = self.stop_inner().await {
+                log::warn!("停止代理服务器失败（将继续恢复 Live 配置）: {e}");
+            }
         }
 
-        // 2. 恢复原始 Live 配置
+        // 2. 恢复原始 Live 配置（不持有网关锁，避免与应用级切换锁反向等待）
         self.restore_live_configs().await?;
 
         // 3. 更新 proxy_config 表中的 live_takeover_active 标志（兼容旧版）
@@ -3099,6 +3201,100 @@ impl ProxyService {
     ) -> Result<HotSwitchOutcome, String> {
         let _guard = self.switch_locks.lock_for_app(app_type).await;
         self.hot_switch_provider_inner(app_type, provider_id).await
+    }
+
+    /// Update a Codex Desktop failover target without touching Desktop's
+    /// gateway route or the `proxy_config` table. The route is shared; only
+    /// the logical target and the gateway-served model catalog need to move.
+    pub async fn switch_failover_target(
+        &self,
+        app_type: &str,
+        provider_id: &str,
+    ) -> Result<HotSwitchOutcome, String> {
+        // Keep the per-app lock first, matching set_takeover_for_app and the
+        // Desktop toggle command. The lifecycle lock then makes the target
+        // update atomic with a concurrent shared-gateway stop.
+        let _app_guard = self.switch_locks.lock_for_app(app_type).await;
+        let _gateway_guard = self.lock_gateway_lifecycle().await;
+        self.switch_failover_target_inner(app_type, provider_id)
+            .await
+    }
+
+    pub(crate) async fn switch_failover_target_inner(
+        &self,
+        app_type: &str,
+        provider_id: &str,
+    ) -> Result<HotSwitchOutcome, String> {
+        let app_type_enum =
+            AppType::from_str(app_type).map_err(|error| format!("无效的应用类型: {error}"))?;
+        if !matches!(&app_type_enum, AppType::CodexDesktop) {
+            return Err(format!("{app_type} 不支持独立故障转移切换"));
+        }
+
+        let provider = self
+            .db
+            .get_provider_by_id(provider_id, app_type)
+            .map_err(|error| format!("读取供应商失败: {error}"))?
+            .ok_or_else(|| format!("供应商不存在: {provider_id}"))?;
+        if !crate::proxy::provider_router::provider_supports_failover(app_type, &provider) {
+            return Err("该供应商不支持 Codex Desktop 故障转移".to_string());
+        }
+
+        // The request router only walks the persisted failover queue. Keep
+        // the logical current target in that same set so tray/profile calls
+        // cannot point Desktop at a provider that requests will never try.
+        if !self
+            .db
+            .is_in_failover_queue(app_type, provider_id)
+            .map_err(|error| format!("读取故障转移队列失败: {error}"))?
+        {
+            return Err("该供应商尚未加入 Codex Desktop 故障转移队列".to_string());
+        }
+
+        let previous_provider_id =
+            crate::settings::get_effective_current_provider(&self.db, &app_type_enum)
+                .map_err(|error| format!("读取当前供应商失败: {error}"))?;
+        let previous_local_provider_id = crate::settings::get_current_provider(&app_type_enum);
+        let logical_target_changed = previous_provider_id.as_deref() != Some(provider_id);
+
+        if let Err(error) = crate::settings::set_current_provider(&app_type_enum, Some(provider_id))
+        {
+            return Err(format!("更新本地当前供应商失败: {error}"));
+        }
+        if let Err(error) = self.db.set_current_provider(app_type, provider_id) {
+            if let Err(rollback_error) = crate::settings::set_current_provider(
+                &app_type_enum,
+                previous_local_provider_id.as_deref(),
+            ) {
+                log::error!(
+                    "Desktop 故障转移数据库切换失败后恢复本地当前供应商失败: {rollback_error}"
+                );
+            }
+            return Err(format!("更新当前供应商失败: {error}"));
+        }
+
+        // Desktop's /models endpoint serves the generated catalog from disk.
+        // Refresh it independently of auth/config so a failover target with a
+        // different model catalog is visible without rewriting Desktop's
+        // gateway credentials. A malformed optional catalog must not prevent
+        // the actual provider failover from succeeding.
+        if let Err(error) = crate::codex_desktop_config::refresh_model_catalog(&provider) {
+            log::warn!(
+                "Codex Desktop 故障转移目标 {} 的模型目录刷新失败（继续切换）: {}",
+                provider.id,
+                error
+            );
+        }
+
+        if let Some(server) = self.server.read().await.as_ref() {
+            server
+                .set_active_target(app_type, &provider.id, &provider.name)
+                .await;
+        }
+
+        Ok(HotSwitchOutcome {
+            logical_target_changed,
+        })
     }
 
     pub(crate) async fn hot_switch_provider_inner(
@@ -4304,6 +4500,9 @@ impl ProxyService {
                     .reproject_takeover_live_config_if_enabled(&app_type)
                     .await?;
             }
+            updated_any |= self
+                .reproject_codex_desktop_gateway_route_if_active()
+                .await?;
 
             if updated_any {
                 log::info!("已同步更新 Live 配置中的代理地址");
@@ -4321,6 +4520,61 @@ impl ProxyService {
     /// 检查服务器是否正在运行
     pub async fn is_running(&self) -> bool {
         self.server.read().await.is_some()
+    }
+
+    /// 返回共享代理网关是否仍被任一功能使用。
+    ///
+    /// Desktop 的故障转移不创建 `proxy_config` 接管行，因此不能只依赖
+    /// `is_live_takeover_active()` 判断是否可以停止共享服务器。
+    async fn has_active_gateway_consumer(&self) -> Result<bool, String> {
+        let live_takeover_active = self
+            .db
+            .is_live_takeover_active()
+            .await
+            .map_err(|error| error.to_string())?;
+        let codex_desktop_failover_enabled = self
+            .db
+            .get_codex_desktop_auto_failover_enabled()
+            .map_err(|error| error.to_string())?;
+        let codex_desktop_proxy_active = self.codex_desktop_uses_gateway().await?;
+        Ok(live_takeover_active || codex_desktop_failover_enabled || codex_desktop_proxy_active)
+    }
+
+    async fn codex_desktop_uses_gateway(&self) -> Result<bool, String> {
+        let current_provider_id =
+            crate::settings::get_effective_current_provider(&self.db, &AppType::CodexDesktop)
+                .map_err(|error| error.to_string())?;
+        let Some(provider_id) = current_provider_id else {
+            return Ok(false);
+        };
+
+        let provider = self
+            .db
+            .get_provider_by_id(&provider_id, AppType::CodexDesktop.as_str())
+            .map_err(|error| error.to_string())?;
+        Ok(provider.is_some_and(|provider| {
+            matches!(
+                crate::codex_desktop_config::provider_mode(&provider),
+                crate::provider::CodexDesktopMode::Proxy
+            )
+        }))
+    }
+
+    /// Re-project only Desktop's gateway URL after a shared proxy restart.
+    ///
+    /// Unlike Live-takeover apps, Desktop does not have a `proxy_config`
+    /// row. Its selected Proxy provider is the source of truth for whether
+    /// the independent Desktop config still needs the gateway route.
+    async fn reproject_codex_desktop_gateway_route_if_active(&self) -> Result<bool, String> {
+        let app_type = AppType::CodexDesktop;
+        let _guard = self.switch_locks.lock_for_app(app_type.as_str()).await;
+        if !self.codex_desktop_uses_gateway().await? {
+            return Ok(false);
+        }
+
+        crate::codex_desktop_config::refresh_gateway_route(self.db.as_ref())
+            .map_err(|error| format!("更新 Codex Desktop 本地路由地址失败: {error}"))?;
+        Ok(true)
     }
 
     /// 热更新熔断器配置
@@ -4378,7 +4632,7 @@ impl ProxyService {
 mod tests {
     use super::*;
     use crate::app_config::{McpApps, McpServer};
-    use crate::provider::{AuthBinding, AuthBindingSource, ProviderMeta};
+    use crate::provider::{AuthBinding, AuthBindingSource, CodexDesktopMode, ProviderMeta};
     use serial_test::serial;
     use std::env;
     use tempfile::TempDir;
@@ -4443,6 +4697,14 @@ mod tests {
         }
     }
 
+    struct SettingsRestore(crate::settings::AppSettings);
+
+    impl Drop for SettingsRestore {
+        fn drop(&mut self) {
+            let _ = crate::settings::update_settings(self.0.clone());
+        }
+    }
+
     fn assert_env_str(env: &Map<String, Value>, key: &str, expected: Option<&str>) {
         assert_eq!(env.get(key).and_then(|value| value.as_str()), expected);
     }
@@ -4463,6 +4725,361 @@ mod tests {
         assert!(service.set_takeover_for_app("pi", true).await.is_err());
         assert!(!service.is_running().await);
         assert!(service.switch_proxy_target("pi", "missing").await.is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn codex_desktop_failover_target_keeps_live_files_unchanged() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload isolated settings");
+        let previous_settings = crate::settings::get_settings();
+        let mut isolated_settings = previous_settings.clone();
+        isolated_settings.codex_config_dir = Some(
+            _home
+                .dir
+                .path()
+                .join("codex-cli")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        isolated_settings.codex_desktop_config_dir = Some(
+            _home
+                .dir
+                .path()
+                .join("codex-desktop")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        crate::settings::update_settings(isolated_settings).expect("isolate Codex directories");
+        let _settings_restore = SettingsRestore(previous_settings);
+        let db = Arc::new(Database::memory().expect("init db"));
+        let make_provider = |id: &str| {
+            let mut provider = Provider::with_id(
+                id.to_string(),
+                format!("Desktop {id}"),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "key" },
+                    "config": "model_provider = \"upstream\"\n"
+                }),
+                None,
+            );
+            provider.meta = Some(ProviderMeta {
+                codex_desktop_mode: Some(CodexDesktopMode::Proxy),
+                ..Default::default()
+            });
+            provider
+        };
+        let first = make_provider("desktop-first");
+        let mut second = make_provider("desktop-second");
+        second.settings_config["modelCatalog"] = json!({
+            "models": [{ "model": "desktop-second-model" }]
+        });
+        db.save_provider(AppType::CodexDesktop.as_str(), &first)
+            .expect("save first provider");
+        db.save_provider(AppType::CodexDesktop.as_str(), &second)
+            .expect("save second provider");
+        db.set_current_provider(AppType::CodexDesktop.as_str(), &first.id)
+            .expect("set current provider");
+        db.add_to_failover_queue(AppType::CodexDesktop.as_str(), &first.id)
+            .expect("queue first provider");
+        db.add_to_failover_queue(AppType::CodexDesktop.as_str(), &second.id)
+            .expect("queue second provider");
+
+        let paths =
+            crate::codex_config::CodexPaths::for_target(crate::codex_config::CodexTarget::Desktop);
+        std::fs::create_dir_all(&paths.root).expect("create Desktop config directory");
+        std::fs::write(&paths.auth, br#"{"OPENAI_API_KEY":"live"}"#).expect("write auth snapshot");
+        std::fs::write(&paths.config, b"model_provider = \"cc_switch\"\n")
+            .expect("write config snapshot");
+        let auth_before = std::fs::read(&paths.auth).expect("read auth snapshot");
+        let config_before = std::fs::read(&paths.config).expect("read config snapshot");
+        let catalog_path = crate::codex_config::get_codex_model_catalog_path_for(
+            crate::codex_config::CodexTarget::Desktop,
+        );
+        if let Some(parent) = catalog_path.parent() {
+            std::fs::create_dir_all(parent).expect("create Desktop catalog directory");
+        }
+        std::fs::write(
+            &catalog_path,
+            br#"{"models":[{"model":"desktop-first-model"}]}"#,
+        )
+        .expect("write initial Desktop catalog");
+
+        let service = ProxyService::new(db.clone());
+        let outcome = service
+            .switch_failover_target(AppType::CodexDesktop.as_str(), &second.id)
+            .await
+            .expect("switch Desktop failover target");
+
+        assert!(outcome.logical_target_changed);
+        assert_eq!(
+            crate::settings::get_effective_current_provider(&db, &AppType::CodexDesktop,)
+                .expect("read current provider"),
+            Some(second.id.clone())
+        );
+        assert_eq!(
+            db.get_current_provider(AppType::CodexDesktop.as_str())
+                .expect("read database current provider"),
+            Some(second.id)
+        );
+        assert_eq!(
+            std::fs::read(&paths.auth).expect("read auth after switch"),
+            auth_before
+        );
+        assert_eq!(
+            std::fs::read(&paths.config).expect("read config after switch"),
+            config_before
+        );
+        let catalog_after =
+            std::fs::read_to_string(&catalog_path).expect("read catalog after switch");
+        assert!(
+            catalog_after.contains("desktop-second-model"),
+            "failover should refresh the gateway-served Desktop model catalog"
+        );
+        assert!(db
+            .get_live_backup(AppType::CodexDesktop.as_str())
+            .await
+            .expect("read Desktop backup")
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stop_with_restore_rejects_while_codex_desktop_failover_is_enabled() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        db.set_codex_desktop_auto_failover_enabled(true)
+            .expect("enable Desktop failover");
+        let service = ProxyService::new(db.clone());
+
+        let error = service
+            .stop_with_restore()
+            .await
+            .expect_err("stopping the shared gateway must require failover to be disabled");
+        assert!(
+            error.contains("请先关闭故障转移"),
+            "unexpected error: {error}"
+        );
+        assert!(db
+            .get_codex_desktop_auto_failover_enabled()
+            .expect("read Desktop failover state"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_stop_rejects_while_codex_desktop_failover_is_enabled() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        db.set_codex_desktop_auto_failover_enabled(true)
+            .expect("enable Desktop failover");
+        let service = ProxyService::new(db);
+
+        let error = service
+            .stop_for_manual_request()
+            .await
+            .expect_err("manual stop must not race an enabled Desktop failover");
+        assert!(
+            error.contains("请先关闭故障转移"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn desktop_failover_counts_as_shared_gateway_consumer() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+
+        assert!(!service
+            .has_active_gateway_consumer()
+            .await
+            .expect("read initial gateway consumers"));
+
+        db.set_codex_desktop_auto_failover_enabled(true)
+            .expect("enable Desktop failover");
+        assert!(service
+            .has_active_gateway_consumer()
+            .await
+            .expect("Desktop failover should keep gateway in use"));
+
+        db.set_codex_desktop_auto_failover_enabled(false)
+            .expect("disable Desktop failover");
+        let mut legacy_config = db
+            .get_proxy_config_for_app(AppType::Codex.as_str())
+            .await
+            .expect("read legacy proxy config");
+        legacy_config.enabled = true;
+        db.update_proxy_config_for_app(legacy_config)
+            .await
+            .expect("enable legacy takeover config");
+        assert!(service
+            .has_active_gateway_consumer()
+            .await
+            .expect("live takeover should keep gateway in use"));
+
+        let mut legacy_config = db
+            .get_proxy_config_for_app(AppType::Codex.as_str())
+            .await
+            .expect("read legacy proxy config");
+        legacy_config.enabled = false;
+        db.update_proxy_config_for_app(legacy_config)
+            .await
+            .expect("disable legacy takeover config");
+        assert!(!service
+            .has_active_gateway_consumer()
+            .await
+            .expect("read cleared gateway consumers"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn desktop_proxy_provider_keeps_shared_gateway_alive_without_failover() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload isolated settings");
+        let previous_settings = crate::settings::get_settings();
+        let mut isolated_settings = previous_settings.clone();
+        isolated_settings.current_provider_codex_desktop = Some("desktop-proxy".to_string());
+        crate::settings::update_settings(isolated_settings).expect("set isolated Desktop current");
+        let _settings_restore = SettingsRestore(previous_settings);
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let mut provider = Provider::with_id(
+            "desktop-proxy".to_string(),
+            "Desktop Proxy".to_string(),
+            serde_json::json!({"auth": {}, "config": ""}),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            codex_desktop_mode: Some(CodexDesktopMode::Proxy),
+            ..Default::default()
+        });
+        db.save_provider(AppType::CodexDesktop.as_str(), &provider)
+            .expect("save Desktop Proxy provider");
+        db.set_codex_desktop_auto_failover_enabled(false)
+            .expect("keep Desktop failover disabled");
+
+        let service = ProxyService::new(db);
+        assert!(service
+            .has_active_gateway_consumer()
+            .await
+            .expect("Desktop Proxy provider should keep gateway in use"));
+        let error = service
+            .stop_with_restore()
+            .await
+            .expect_err("manual restore must preserve an active Desktop Proxy route");
+        assert!(
+            error.contains("当前 Proxy 模式供应商仍在使用本地路由"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_stop_rejects_while_codex_desktop_proxy_provider_is_active() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload isolated settings");
+        let previous_settings = crate::settings::get_settings();
+        let mut isolated_settings = previous_settings.clone();
+        isolated_settings.current_provider_codex_desktop = Some("desktop-proxy".to_string());
+        crate::settings::update_settings(isolated_settings).expect("set isolated Desktop current");
+        let _settings_restore = SettingsRestore(previous_settings);
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let mut provider = Provider::with_id(
+            "desktop-proxy".to_string(),
+            "Desktop Proxy".to_string(),
+            serde_json::json!({"auth": {}, "config": ""}),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            codex_desktop_mode: Some(CodexDesktopMode::Proxy),
+            ..Default::default()
+        });
+        db.save_provider(AppType::CodexDesktop.as_str(), &provider)
+            .expect("save Desktop Proxy provider");
+
+        let service = ProxyService::new(db);
+        let error = service
+            .stop_for_manual_request()
+            .await
+            .expect_err("manual stop must preserve an active Desktop Proxy route");
+        assert!(
+            error.contains("当前 Proxy 模式供应商仍在使用本地路由"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn reprojects_codex_desktop_gateway_route_after_listener_change() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload isolated settings");
+        let previous_settings = crate::settings::get_settings();
+        let mut isolated_settings = previous_settings.clone();
+        isolated_settings.current_provider_codex_desktop = Some("desktop-proxy".to_string());
+        isolated_settings.codex_config_dir = Some(
+            _home
+                .dir
+                .path()
+                .join("codex-cli")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        isolated_settings.codex_desktop_config_dir = Some(
+            _home
+                .dir
+                .path()
+                .join("codex-desktop")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        crate::settings::update_settings(isolated_settings).expect("set isolated Desktop settings");
+        let _settings_restore = SettingsRestore(previous_settings);
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let mut provider = Provider::with_id(
+            "desktop-proxy".to_string(),
+            "Desktop Proxy".to_string(),
+            serde_json::json!({"auth": {}, "config": "model_provider = \"upstream\"\n"}),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            codex_desktop_mode: Some(CodexDesktopMode::Proxy),
+            ..Default::default()
+        });
+        db.save_provider(AppType::CodexDesktop.as_str(), &provider)
+            .expect("save Desktop Proxy provider");
+
+        let mut config = db.get_proxy_config().await.expect("read proxy config");
+        config.listen_address = "127.0.0.1".to_string();
+        config.listen_port = 19876;
+        db.update_proxy_config(config)
+            .await
+            .expect("save changed listener");
+
+        let paths =
+            crate::codex_config::CodexPaths::for_target(crate::codex_config::CodexTarget::Desktop);
+        std::fs::create_dir_all(&paths.root).expect("create Desktop config directory");
+        std::fs::write(&paths.auth, br#"{"OPENAI_API_KEY":"desktop-token"}"#)
+            .expect("write Desktop auth");
+        std::fs::write(&paths.config, "model_provider = \"upstream\"\n")
+            .expect("write old Desktop route");
+        let auth_before = std::fs::read(&paths.auth).expect("read Desktop auth");
+
+        let service = ProxyService::new(db);
+        assert!(service
+            .reproject_codex_desktop_gateway_route_if_active()
+            .await
+            .expect("reproject Desktop gateway route"));
+
+        let config_after = std::fs::read_to_string(&paths.config).expect("read Desktop config");
+        assert!(config_after.contains("http://127.0.0.1:19876/codex-desktop/v1"));
+        assert_eq!(
+            std::fs::read(&paths.auth).expect("read Desktop auth after reproject"),
+            auth_before,
+            "listener changes must not overwrite Desktop auth.json"
+        );
     }
 
     async fn running_codex_base_url(service: &ProxyService) -> String {

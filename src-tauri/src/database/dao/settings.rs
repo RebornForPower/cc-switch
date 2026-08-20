@@ -8,6 +8,11 @@ use rusqlite::params;
 
 impl Database {
     const LEGACY_COMMON_CONFIG_MIGRATED_KEY: &'static str = "common_config_legacy_migrated_v1";
+    /// Codex Desktop owns its failover flag in the generic settings table.
+    /// It must stay out of `proxy_config`, whose schema intentionally covers
+    /// only the full Live-takeover applications.
+    pub const CODEX_DESKTOP_AUTO_FAILOVER_ENABLED_KEY: &'static str =
+        "codex_desktop_auto_failover_enabled";
 
     fn config_snippet_cleared_key(app_type: &str) -> String {
         format!("common_config_{app_type}_cleared")
@@ -43,6 +48,19 @@ impl Database {
             self.get_setting(key)?.as_deref(),
             Some("true") | Some("1")
         ))
+    }
+
+    /// Read the independent Codex Desktop failover switch.
+    pub fn get_codex_desktop_auto_failover_enabled(&self) -> Result<bool, AppError> {
+        self.get_bool_flag(Self::CODEX_DESKTOP_AUTO_FAILOVER_ENABLED_KEY)
+    }
+
+    /// Persist the independent Codex Desktop failover switch.
+    pub fn set_codex_desktop_auto_failover_enabled(&self, enabled: bool) -> Result<(), AppError> {
+        self.set_setting(
+            Self::CODEX_DESKTOP_AUTO_FAILOVER_ENABLED_KEY,
+            if enabled { "true" } else { "false" },
+        )
     }
 
     /// 设置值
@@ -323,5 +341,35 @@ impl Database {
         let json = serde_json::to_string(config)
             .map_err(|e| AppError::Database(format!("序列化日志配置失败: {e}")))?;
         self.set_setting("log_config", &json)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Database;
+
+    #[test]
+    fn codex_desktop_failover_flag_round_trips_without_proxy_config_row() {
+        let db = Database::memory().expect("create memory db");
+
+        assert!(!db
+            .get_codex_desktop_auto_failover_enabled()
+            .expect("read default flag"));
+
+        db.set_codex_desktop_auto_failover_enabled(true)
+            .expect("enable flag");
+        assert!(db
+            .get_codex_desktop_auto_failover_enabled()
+            .expect("read enabled flag"));
+
+        let conn = db.conn.lock().expect("lock database");
+        let desktop_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM proxy_config WHERE app_type = 'codex-desktop'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count proxy config rows");
+        assert_eq!(desktop_rows, 0);
     }
 }

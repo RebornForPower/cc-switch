@@ -70,6 +70,22 @@ export function isProxyAppId(appId: string): appId is ProxyAppId {
   return (PROXY_APP_IDS as string[]).includes(appId);
 }
 
+/** Apps that can use the provider failover queue. Desktop has its own
+ * gateway-backed switch and is intentionally not a full proxy app. */
+export type FailoverAppId = Extract<AppId, ProxyAppId | "codex-desktop">;
+
+export const FAILOVER_APP_IDS: FailoverAppId[] = [
+  "claude",
+  "codex",
+  "codex-desktop",
+  "gemini",
+  "grokbuild",
+];
+
+export function isFailoverAppId(appId: string): appId is FailoverAppId {
+  return (FAILOVER_APP_IDS as string[]).includes(appId);
+}
+
 export type AdditiveAppId = Extract<
   AppId,
   "opencode" | "openclaw" | "hermes" | "pi"

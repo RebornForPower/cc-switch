@@ -22,7 +22,7 @@ import {
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import type { FailoverQueueItem } from "@/types/proxy";
-import type { ProxyAppId } from "@/config/appConfig";
+import type { FailoverAppId } from "@/config/appConfig";
 import {
   useFailoverQueue,
   useAvailableProvidersForFailover,
@@ -33,7 +33,7 @@ import {
 } from "@/lib/query/failover";
 
 interface FailoverQueueManagerProps {
-  appType: ProxyAppId;
+  appType: FailoverAppId;
   disabled?: boolean;
 }
 
@@ -47,6 +47,11 @@ export function FailoverQueueManager({
   // 故障转移开关状态（每个应用独立）
   const { data: isFailoverEnabled = false } = useAutoFailoverEnabled(appType);
   const setFailoverEnabled = useSetAutoFailoverEnabled();
+  // Keep the cleanup action available if a Desktop gateway stopped
+  // unexpectedly. Enabling still remains blocked until the route is running;
+  // queue editing keeps the caller's original disabled state.
+  const failoverSwitchDisabled =
+    disabled && !(appType === "codex-desktop" && isFailoverEnabled);
 
   // 查询数据
   const {
@@ -148,7 +153,7 @@ export function FailoverQueueManager({
         <Switch
           checked={isFailoverEnabled}
           onCheckedChange={handleToggleFailover}
-          disabled={disabled || setFailoverEnabled.isPending}
+          disabled={failoverSwitchDisabled || setFailoverEnabled.isPending}
         />
       </div>
 

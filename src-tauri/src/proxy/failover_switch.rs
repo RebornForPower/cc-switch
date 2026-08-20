@@ -81,17 +81,22 @@ impl FailoverSwitchManager {
         provider_name: &str,
     ) -> Result<bool, AppError> {
         let app = AppType::from_str(app_type)?;
-        if !app.supports_local_proxy() {
+        if !app.supports_failover() {
             return Ok(false);
         }
 
-        // 检查该应用是否已被代理接管（enabled=true）
-        // 只有被接管的应用才允许执行故障转移切换
-        let app_enabled = match self.db.get_proxy_config_for_app(app_type).await {
-            Ok(config) => config.enabled,
-            Err(e) => {
-                log::warn!("[FO-002] 无法读取 {app_type} 配置: {e}，跳过切换");
-                return Ok(false);
+        let is_codex_desktop = matches!(app, AppType::CodexDesktop);
+        // Live-takeover apps are gated by proxy_config.enabled. Desktop has no
+        // proxy_config row and instead uses its independent settings flag.
+        let app_enabled = if is_codex_desktop {
+            self.db.get_codex_desktop_auto_failover_enabled()?
+        } else {
+            match self.db.get_proxy_config_for_app(app_type).await {
+                Ok(config) => config.enabled,
+                Err(e) => {
+                    log::warn!("[FO-002] 无法读取 {app_type} 配置: {e}，跳过切换");
+                    return Ok(false);
+                }
             }
         };
 
@@ -106,12 +111,24 @@ impl FailoverSwitchManager {
 
         if let Some(app) = app_handle {
             if let Some(app_state) = app.try_state::<crate::store::AppState>() {
-                switched = app_state
-                    .proxy_service
-                    .hot_switch_provider(app_type, provider_id)
-                    .await
-                    .map_err(AppError::Message)?
-                    .logical_target_changed;
+                if is_codex_desktop && !app_state.proxy_service.is_running().await {
+                    log::debug!("[Failover] {app_type} 本地路由未运行，跳过切换");
+                    return Ok(false);
+                }
+
+                switched = if is_codex_desktop {
+                    app_state
+                        .proxy_service
+                        .switch_failover_target(app_type, provider_id)
+                        .await
+                } else {
+                    app_state
+                        .proxy_service
+                        .hot_switch_provider(app_type, provider_id)
+                        .await
+                }
+                .map_err(AppError::Message)?
+                .logical_target_changed;
 
                 if !switched {
                     return Ok(false);
