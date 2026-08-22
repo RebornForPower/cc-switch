@@ -683,9 +683,12 @@ function ProviderFormFull({
       if (initialData?.meta?.codexDesktopMode) {
         return initialData.meta.codexDesktopMode;
       }
+      // Match Rust backend provider_mode fallback in codex_desktop_config.rs:
+      // Non-official third-party providers default to Proxy so they are
+      // immediately eligible for failover without an extra edit cycle.
       return initialData?.meta?.providerType ||
         initialData?.meta?.isFullUrl ||
-        initialCodexApiFormat !== "openai_responses"
+        initialData?.category !== "official"
         ? "proxy"
         : "direct";
     },
@@ -697,11 +700,11 @@ function ProviderFormFull({
       initialData?.meta?.codexDesktopMode ??
         (initialData?.meta?.providerType ||
         initialData?.meta?.isFullUrl ||
-        initialCodexApiFormat !== "openai_responses"
+        initialData?.category !== "official"
           ? "proxy"
           : "direct"),
     );
-  }, [appId, initialData, initialCodexApiFormat]);
+  }, [appId, initialData]);
 
   // Auth-field choice for the Anthropic Messages upstream (defaults to the Bearer form)
   const initialCodexAnthropicAuthField: ClaudeApiKeyField =
@@ -857,7 +860,8 @@ function ProviderFormFull({
     (isCodexOfficialManagedOauthBound ||
       isXaiOauthProvider ||
       localIsFullUrl ||
-      (category !== "official" && localCodexApiFormat !== "openai_responses"));
+      category !== "official" ||
+      localCodexApiFormat !== "openai_responses");
   const effectiveCodexDesktopMode = codexDesktopRequiresProxy
     ? "proxy"
     : codexDesktopMode;
