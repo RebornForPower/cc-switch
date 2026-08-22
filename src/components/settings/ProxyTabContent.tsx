@@ -18,6 +18,7 @@ import { GlobalProxySettings } from "@/components/settings/GlobalProxySettings";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ToggleRow } from "@/components/ui/toggle-row";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
+import { useSetAutoFailoverEnabled } from "@/lib/query/failover";
 import type { SettingsFormState } from "@/hooks/useSettings";
 import { FAILOVER_APP_IDS, getAppLabel } from "@/config/appConfig";
 
@@ -46,6 +47,8 @@ export function ProxyTabContent({
     stopWithRestore,
     isPending: isProxyPending,
   } = useProxyStatus();
+
+  const setAutoFailoverEnabled = useSetAutoFailoverEnabled();
 
   const handleToggleProxy = async (checked: boolean) => {
     try {
@@ -76,6 +79,15 @@ export function ProxyTabContent({
       setShowFailoverConfirm(true);
     } else {
       void onAutoSave({ enableFailoverToggle: checked });
+      // When hiding the failover toggle, also disable Codex Desktop
+      // failover in the backend so the shared gateway can be stopped
+      // without a deadlock.
+      if (!checked) {
+        setAutoFailoverEnabled.mutate({
+          appType: "codex-desktop",
+          enabled: false,
+        });
+      }
     }
   };
 
@@ -144,7 +156,7 @@ export function ProxyTabContent({
         >
           <AccordionTrigger className="px-6 py-4 hover:no-underline hover:bg-muted/50 data-[state=open]:bg-muted/50">
             <div className="flex items-center gap-3">
-              <Activity className="h-5 w-5 text-orange-500" />
+              <ShieldAlert className="h-5 w-5 text-orange-500" />
               <div className="text-left">
                 <h3 className="text-base font-semibold">
                   {t("settings.advanced.failover.title")}
@@ -295,3 +307,4 @@ export function ProxyTabContent({
     </motion.div>
   );
 }
+

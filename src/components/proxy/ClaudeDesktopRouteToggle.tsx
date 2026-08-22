@@ -5,11 +5,14 @@ import { Switch } from "@/components/ui/switch";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
 import { cn } from "@/lib/utils";
 import { useAutoFailoverEnabled } from "@/lib/query/failover";
+import { getAppLabel } from "@/config/appConfig";
 
 interface ClaudeDesktopRouteToggleProps {
   className?: string;
   target?: "claude" | "codex";
 }
+
+const PROXY_APP_IDS = ["claude", "codex", "gemini", "grokbuild"] as const;
 
 export function ClaudeDesktopRouteToggle({
   className,
@@ -32,13 +35,13 @@ export function ClaudeDesktopRouteToggle({
   // the gateway while Desktop still depends on it.
   const { data: codexDesktopFailoverEnabled = false } =
     useAutoFailoverEnabled("codex-desktop");
-  const otherTakeoverActive = Boolean(
-    takeoverStatus?.claude ||
-      takeoverStatus?.codex ||
-      takeoverStatus?.gemini ||
-      takeoverStatus?.grokbuild ||
-      codexDesktopFailoverEnabled,
+
+  // Check which other apps have active takeover (excluding the current target)
+  const otherAppTakeoverActive = PROXY_APP_IDS.some(
+    (appId) => takeoverStatus?.[appId]
   );
+  const codexDesktopFailoverActive = codexDesktopFailoverEnabled;
+
   const routeAddress = status?.address ?? "127.0.0.1";
   const routePort = status?.port ?? 15721;
 
@@ -49,11 +52,26 @@ export function ClaudeDesktopRouteToggle({
         return;
       }
 
-      if (otherTakeoverActive) {
+      if (codexDesktopFailoverActive) {
         toast.warning(
-          t("claudeDesktop.route.stopBlockedByTakeover", {
+          t("claudeDesktop.route.stopBlockedByFailover", {
             defaultValue:
-              "其它应用正在使用代理接管。请先在设置中关闭对应应用接管，再停止本地路由。",
+              "请先关闭 Codex Desktop 故障转移开关，再停止本地路由。",
+          }),
+          { duration: 5000 },
+        );
+        return;
+      }
+
+      if (otherAppTakeoverActive) {
+        const activeApps = PROXY_APP_IDS.filter(
+          (appId) => takeoverStatus?.[appId]
+        );
+        const appNames = activeApps.map((id) => getAppLabel(id)).join("、");
+        toast.warning(
+          t("claudeDesktop.route.stopBlockedByTakeoverDetail", {
+            app: appNames,
+            defaultValue: `${appNames} 正在使用代理接管，请先在设置中关闭后再停止本地路由。`,
           }),
           { duration: 5000 },
         );
@@ -109,3 +127,4 @@ export function ClaudeDesktopRouteToggle({
     </div>
   );
 }
+

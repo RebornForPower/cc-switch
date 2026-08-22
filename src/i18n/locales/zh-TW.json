@@ -239,7 +239,9 @@
         "active": "Claude Desktop 本地路由已開啟 - {{address}}:{{port}}",
         "inactive": "開啟 Claude Desktop 本地路由，用於需要模型對應或格式轉換的供應商。目前設定位址：{{address}}:{{port}}"
       },
-      "stopBlockedByTakeover": "其他應用正在使用代理接管。請先在設定中關閉對應應用接管，再停止本機路由。"
+      "stopBlockedByTakeover": "其他應用正在使用代理接管。請先在設定中關閉對應應用接管，再停止本機路由。",
+      "stopBlockedByFailover": "請先關閉 Codex Desktop 故障轉移開關，再停止本機路由。",
+      "stopBlockedByTakeoverDetail": "{{app}} 正在使用代理接管，請先在設定中關閉後再停止本機路由。"
     }
   },
   "codexDesktop": {
@@ -3281,3 +3283,5 @@
     "refresh": "重新整理"
   }
 }
+
+

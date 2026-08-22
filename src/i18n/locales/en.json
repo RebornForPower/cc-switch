@@ -239,7 +239,9 @@
         "active": "Claude Desktop local routing is running - {{address}}:{{port}}",
         "inactive": "Turn on Claude Desktop local routing for providers that need model mapping or format conversion. Configured address: {{address}}:{{port}}"
       },
-      "stopBlockedByTakeover": "Another app is using proxy takeover. Please disable that app's takeover in settings before stopping local routing."
+      "stopBlockedByTakeover": "Another app is using proxy takeover. Please disable that app's takeover in settings before stopping local routing.",
+      "stopBlockedByFailover": "Please disable Codex Desktop failover before stopping local routing.",
+      "stopBlockedByTakeoverDetail": "{{app}} is using proxy takeover. Please disable it in settings before stopping local routing."
     }
   },
   "codexDesktop": {
@@ -3280,3 +3282,5 @@
     "refresh": "Refresh"
   }
 }
+
+

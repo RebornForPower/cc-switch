@@ -1403,7 +1403,7 @@ function App() {
                   ) : activeApp === "codex-desktop" ? (
                     <>
                       <ClaudeDesktopRouteToggle target="codex" />
-                      {settingsData?.enableFailoverToggle && (
+                      {(settingsData?.enableFailoverToggle || codexDesktopFailoverEnabled) && (
                         <FailoverToggle activeApp="codex-desktop" />
                       )}
                     </>
@@ -1858,3 +1858,5 @@ function App() {
 }
 
 export default App;
+
+

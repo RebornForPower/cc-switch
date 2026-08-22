@@ -239,7 +239,9 @@
         "active": "Claude Desktop ローカルルーティングは起動中です - {{address}}:{{port}}",
         "inactive": "モデルマッピングや形式変換が必要なプロバイダー向けに Claude Desktop ローカルルーティングを起動します。設定アドレス: {{address}}:{{port}}"
       },
-      "stopBlockedByTakeover": "別のアプリがプロキシテイクオーバーを使用しています。設定で該当アプリのテイクオーバーを無効にしてから、ローカルルーティングを停止してください。"
+      "stopBlockedByTakeover": "別のアプリがプロキシテイクオーバーを使用しています。設定で該当アプリのテイクオーバーを無効にしてから、ローカルルーティングを停止してください。",
+      "stopBlockedByFailover": "Codex Desktop のフェイルオーバーを無効にしてから、ローカルルーティングを停止してください。",
+      "stopBlockedByTakeoverDetail": "{{app}} がプロキシテイクオーバーを使用しています。設定で無効にしてから停止してください。"
     }
   },
   "codexDesktop": {
@@ -3280,3 +3282,5 @@
     "refresh": "更新"
   }
 }
+
+
